@@ -43,6 +43,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         model.onRequestHidePanel = { [weak self] in self?.panel.hide() }
         model.onRequestShowSettings = { [weak self] in self?.showSettings() }
         model.onCopyFeedback = { [weak self] in self?.statusItem.flip() }
+        model.onIconStateChanged = { [weak self] in self?.statusItem.refreshIcon() }
         model.onReactivatePreviousApp = { [weak self] in self?.panel.reactivatePreviousApp() }
         model.pasteTargetProvider = { [weak self] in self?.panel.pasteTarget }
 

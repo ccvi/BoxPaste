@@ -19,7 +19,8 @@ enum ViewMode: String, Codable, CaseIterable, Identifiable {
 
     var id: String { rawValue }
 
-    /// ⌘数字快捷键的编号（WindowControllers 里 ⌘1/2/3 按视图**类型**绑定）。
+    /// ⌥数字快捷键的编号（WindowControllers 里 ⌥1/2/3 按视图**类型**绑定；
+    /// ⌘1-9 已让位给"直接粘贴第 N 条"——Maccy 的习惯键位，更高频）。
     /// 顶部按钮的显示顺序（丰富→简洁→网格，用户指定）与它无关——
     /// 按钮换了位置快捷键还认类型，tooltip 的编号要从这里取，别用显示下标。
     var shortcutDigit: Int {
@@ -75,6 +76,9 @@ struct Preferences: Codable, Equatable {
     var pollInterval: Double = 0.35
     /// 忽略密码管理器等标记为"保密/临时"的剪贴板内容
     var ignoreConcealed: Bool = true
+    /// 记录富文本（RTF/HTML）：开着粘贴能保住格式，代价是 blobs 目录变大。
+    /// 菜单栏右键可随时开关（用户要求），默认开。
+    var captureRichText: Bool = true
     var defaultView: ViewMode = .rich
     var categories: [Category] = Category.builtins
     var shortcuts: [String: KeySpec] = Preferences.defaultShortcuts
@@ -121,6 +125,7 @@ struct Preferences: Codable, Equatable {
         autoPaste = try container.decodeIfPresent(Bool.self, forKey: .autoPaste) ?? fallback.autoPaste
         pollInterval = try container.decodeIfPresent(Double.self, forKey: .pollInterval) ?? fallback.pollInterval
         ignoreConcealed = try container.decodeIfPresent(Bool.self, forKey: .ignoreConcealed) ?? fallback.ignoreConcealed
+        captureRichText = try container.decodeIfPresent(Bool.self, forKey: .captureRichText) ?? fallback.captureRichText
         defaultView = try container.decodeIfPresent(ViewMode.self, forKey: .defaultView) ?? fallback.defaultView
         categories = try container.decodeIfPresent([Category].self, forKey: .categories) ?? fallback.categories
         shortcuts = try container.decodeIfPresent([String: KeySpec].self, forKey: .shortcuts) ?? fallback.shortcuts
@@ -151,7 +156,7 @@ struct Preferences: Codable, Equatable {
 
     enum CodingKeys: String, CodingKey {
         case maxItems, hideDockIcon, showInDock, animateStatusIcon, playSound, feedbackSound, autoPaste, pollInterval
-        case ignoreConcealed, defaultView, categories, shortcuts, launchAtLogin
+        case ignoreConcealed, captureRichText, defaultView, categories, shortcuts, launchAtLogin
         case panelWidth, panelHeight, alwaysOnTop
     }
 }

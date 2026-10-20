@@ -28,6 +28,9 @@ final class ClipboardWatcher {
     /// 图像上限：再大的基本不是"复制素材"而是"剪贴板里卡着一张巨图"，
     /// 硬记下来只会把 App Support 撑爆。
     private let maxImageBytes = 60 * 1024 * 1024
+    /// 富文本上限：RTF/HTML 超过这个量级基本是"整个文档塞进了剪贴板"，
+    /// 留着只会让 blobs 目录膨胀，不值得。
+    private let maxRichBytes = 8 * 1024 * 1024
     private let thumbnailMaxSide: CGFloat = 600
 
     private let store: ClipStore
@@ -37,6 +40,14 @@ final class ClipboardWatcher {
     private var currentInterval: TimeInterval = 0.35
     private var ignoreConcealed = true
     private var didPrimeClipboard = false
+
+    /// 暂停记录（隐私模式）。true 时轮询照常跑、changeCount 照常登记，
+    /// 只是不收内容——这样恢复记录后不会把暂停期间的积压一股脑倒进历史。
+    /// 刻意不持久化：重启默认恢复记录，避免"开关忘在暂停上，以为软件坏了"。
+    var paused = false
+    /// 是否连 RTF/HTML 一起记录（菜单栏可开关）。关掉时只留纯文本，
+    /// 给"暂时不想让 blobs 长胖"的时刻用。
+    var captureRichText = true
 
     init(store: ClipStore) {
         self.store = store
@@ -107,6 +118,9 @@ final class ClipboardWatcher {
 
         if ignoredChangeCounts.remove(changeCount) != nil { return }
 
+        // 隐私模式：只登记变化、不收内容（见 paused 的注释）
+        if paused { return }
+
         guard let item = makeItem(from: pasteboard) else { return }
         emit(item)
     }
@@ -136,6 +150,13 @@ final class ClipboardWatcher {
         }
         guard var result = item else { return nil }
 
+        // 富文本：开关打开时把剪贴板里的 RTF/HTML 一并存档（RTF 文字处理软件给、
+        // HTML 浏览器给，两个都要——写回时一起挂，目标应用爱挑哪种挑哪种）。
+        if captureRichText {
+            Self.attachRichText(to: &result, from: pasteboard, store: store,
+                                maxBytes: maxRichBytes)
+        }
+
         // 来源应用在**捕获时**取，不等到写盘：轮询有延迟，
         // 稍后再问"现在最前面是谁"很可能已经换人了。
         if let frontmost, frontmost.bundleIdentifier != Bundle.main.bundleIdentifier {
@@ -154,6 +175,24 @@ final class ClipboardWatcher {
                         text: text,
                         byteCount: text.utf8.count,
                         hash: Support.sha256("\(kind.rawValue):\(text)"))
+    }
+
+    /// 把剪贴板里的 RTF/HTML 存进 blobs/ 并挂到条目上。
+    /// 存档名由内容 hash 派生（同文本必然同名），与图像 blob 的命名规则一致。
+    /// 抽成静态是因为自检要直接构造假剪贴板跑它，不走轮询。
+    static func attachRichText(to item: inout ClipItem, from pasteboard: NSPasteboard,
+                               store: ClipStore, maxBytes: Int) {
+        guard item.kind == .text || item.kind == .link || item.kind == .color else { return }
+        if let rtf = pasteboard.data(forType: .rtf), rtf.count <= maxBytes {
+            let name = "\(item.hash).rtf"
+            try? store.writeBlob(data: rtf, name: name)
+            item.rtfBlobName = name
+        }
+        if let html = pasteboard.data(forType: .html), html.count <= maxBytes {
+            let name = "\(item.hash).html"
+            try? store.writeBlob(data: html, name: name)
+            item.htmlBlobName = name
+        }
     }
 
     static func fileItem(_ urls: [URL]) -> ClipItem {

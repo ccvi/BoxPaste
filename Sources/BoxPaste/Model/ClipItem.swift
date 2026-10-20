@@ -65,6 +65,11 @@ struct ClipItem: Identifiable, Codable, Equatable {
     /// 图像的像素尺寸（可选，用于预览信息）
     var pixelWidth: Int?
     var pixelHeight: Int?
+    /// 富文本存档（blobs/ 下的文件名）。捕获时若剪贴板带了 RTF/HTML 就存下来，
+    /// 写回剪贴板时一并挂上，粘贴到文字处理软件里还能保住格式。
+    /// 两个都是可选：1.0.14 及以前的条目、以及关闭"记录富文本"后捕获的条目没有。
+    var rtfBlobName: String?
+    var htmlBlobName: String?
 
     /// 参与搜索与「包含/正则」规则匹配的正文。
     /// 文件条目把路径也纳入，这样搜文件名能命中。

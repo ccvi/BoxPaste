@@ -20,6 +20,10 @@ struct PanelRootView: View {
             HeaderBar()
             CategoryTabs()
 
+            if !model.multiSelection.isEmpty {
+                MultiSelectBar()
+            }
+
             if let hint = model.hint {
                 HintBar(text: hint)
             }
@@ -202,7 +206,7 @@ struct ViewModeSwitch: View {
                                     in: RoundedRectangle(cornerRadius: 7, style: .continuous))
                 }
                 .buttonStyle(.plain)
-                .help("\(mode.title)（⌘\(mode.shortcutDigit)）")
+                .help("\(mode.title)（⌥\(mode.shortcutDigit)）")
             }
         }
         .padding(2)
@@ -283,6 +287,35 @@ struct HintBar: View {
             Spacer(minLength: 0)
         }
         .foregroundStyle(Color.accentColor)
+        .padding(.horizontal, Theme.contentPadding)
+        .padding(.bottom, 8)
+    }
+}
+
+// ── 多选批量操作条 ───────────────────────────────────────────
+
+/// ⌘单击勾选条目后出现：批量删除 / 批量收藏 / 取消。
+/// 放在分类标签下面、列表上面——操作对象就是下面的列表，位置要贴着。
+struct MultiSelectBar: View {
+    @EnvironmentObject var model: AppModel
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Text("已选 \(model.multiSelection.count) 项")
+                .font(.system(size: 12, weight: .medium))
+                .monospacedDigit()
+            Spacer(minLength: 8)
+            Button("收藏") { model.addMultiSelectionToFavorites() }
+                .controlSize(.small)
+                .buttonStyle(.bordered)
+            Button("删除") { model.deleteMultiSelection() }
+                .controlSize(.small)
+                .buttonStyle(.bordered)
+            Button("取消") { model.clearMultiSelection() }
+                .controlSize(.small)
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+        }
         .padding(.horizontal, Theme.contentPadding)
         .padding(.bottom, 8)
     }
@@ -433,6 +466,13 @@ struct GridCard: View {
 
     private var isSelected: Bool { model.selectedID == item.id }
 
+    /// 行底色：多选勾中的优先级最高（批量操作时段，视觉焦点是"哪些被勾了"），
+    /// 其余保持悬停蓝 > 单选灰的旧次序。
+    private var rowFill: Color {
+        if model.multiSelection.contains(item.id) { return Theme.selectionFill.opacity(0.55) }
+        return hovering ? Theme.selectionFill : (isSelected ? Theme.hoverFill : .clear)
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             ZStack {
@@ -460,13 +500,14 @@ struct GridCard: View {
         .padding(8)
         // 蓝框跟着鼠标走（用户指定）：悬停才画蓝框，选中只留浅灰底——
         // 键盘上下选行时仍有迹可循，但不会常驻一个刺眼的蓝框。
-        .background(hovering ? Theme.selectionFill : (isSelected ? Theme.hoverFill : .clear),
+        .background(rowFill,
                     in: RoundedRectangle(cornerRadius: Theme.cardCorner, style: .continuous))
         .overlay {
             RoundedRectangle(cornerRadius: Theme.cardCorner, style: .continuous)
                 .strokeBorder(hovering ? Theme.selectionStroke.opacity(0.8) : Theme.cardBorder,
                               lineWidth: hovering ? 1.5 : 1)
         }
+        .multiSelectBadge(model: model, item: item)
         .contentShape(Rectangle())
         .onHover { hovering = $0 }
         .clipItemGestures(model: model, item: item)
@@ -515,6 +556,12 @@ struct CompactRow: View {
 
     private var isSelected: Bool { model.selectedID == item.id }
 
+    /// 行底色：多选优先（理由见 GridCard.rowFill）
+    private var rowFill: Color {
+        if model.multiSelection.contains(item.id) { return Theme.selectionFill.opacity(0.55) }
+        return hovering ? Theme.selectionFill : (isSelected ? Theme.hoverFill : .clear)
+    }
+
     var body: some View {
         HStack(spacing: 8) {
             ItemArtwork(item: item, style: .mini)
@@ -534,7 +581,7 @@ struct CompactRow: View {
         .padding(.horizontal, 8)
         .frame(height: 26)
         // 蓝框跟鼠标走（理由见 GridCard）
-        .background(hovering ? Theme.selectionFill : (isSelected ? Theme.hoverFill : .clear),
+        .background(rowFill,
                     in: RoundedRectangle(cornerRadius: 6, style: .continuous))
         .overlay {
             if hovering {
@@ -542,6 +589,7 @@ struct CompactRow: View {
                     .strokeBorder(Theme.selectionStroke.opacity(0.75), lineWidth: 1.2)
             }
         }
+        .multiSelectBadge(model: model, item: item)
         .contentShape(Rectangle())
         .onHover { hovering = $0 }
         .clipItemGestures(model: model, item: item)
@@ -590,6 +638,12 @@ struct RichRow: View {
 
     private var isSelected: Bool { model.selectedID == item.id }
 
+    /// 行底色：多选优先（理由见 GridCard.rowFill）
+    private var rowFill: Color {
+        if model.multiSelection.contains(item.id) { return Theme.selectionFill.opacity(0.55) }
+        return hovering ? Theme.selectionFill : (isSelected ? Theme.hoverFill : Color.primary.opacity(0.025))
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 6) {
@@ -631,13 +685,14 @@ struct RichRow: View {
         }
         .padding(Theme.cardPadding)
         // 蓝框跟鼠标走（理由见 GridCard）
-        .background(hovering ? Theme.selectionFill : (isSelected ? Theme.hoverFill : Color.primary.opacity(0.025)),
+        .background(rowFill,
                     in: RoundedRectangle(cornerRadius: Theme.cardCorner, style: .continuous))
         .overlay {
             RoundedRectangle(cornerRadius: Theme.cardCorner, style: .continuous)
                 .strokeBorder(hovering ? Theme.selectionStroke.opacity(0.8) : Theme.cardBorder,
                               lineWidth: hovering ? 1.5 : 1)
         }
+        .multiSelectBadge(model: model, item: item)
         .contentShape(Rectangle())
         .onHover { hovering = $0 }
         .clipItemGestures(model: model, item: item)
@@ -928,6 +983,8 @@ struct ShortcutHelpOverlay: View {
 
 extension View {
     /// 行条目的点按手势三件套，三种视图（网格/紧凑/丰富）共用。
+    /// ⌘单击 = 多选开关（配合 MultiSelectBar 批量删除/收藏）；
+    /// 按着 ⌘ 时不做即时选中，避免多选的同时把"当前条目"也改掉。
     func clipItemGestures(model: AppModel, item: ClipItem) -> some View {
         // 双击要先挂：SwiftUI 按"后挂的让位"解析同视图上的多个点按手势，
         // 单击在前会把第一次点击消费掉，双击永远不触发（用户实测踩过）。
@@ -936,11 +993,33 @@ extension View {
             // 不等松手、也不等 ~0.3s 的双击消歧窗口——只靠单击手势的话，
             // 这段时间界面毫无反应，手感就是"迟钝"（用户实测反馈过）。
             .onLongPressGesture(minimumDuration: .infinity, pressing: { pressing in
-                if pressing { model.selectedID = item.id }
+                if pressing, !NSEvent.modifierFlags.contains(.command) {
+                    model.selectedID = item.id
+                }
             }, perform: {})
             // 单击兜底：万一 pressing 没触发，松手后仍会选中——
             // 慢一点，但不会"点了没反应"。
-            .onTapGesture { model.selectedID = item.id }
+            .onTapGesture {
+                if NSEvent.modifierFlags.contains(.command) {
+                    model.toggleMultiSelect(item.id)
+                } else {
+                    model.clearMultiSelection()
+                    model.selectedID = item.id
+                }
+            }
+    }
+
+    /// 多选勾选徽章：右上角一个 ✓ 圆标，只在被勾选时出现。
+    @ViewBuilder
+    func multiSelectBadge(model: AppModel, item: ClipItem) -> some View {
+        overlay(alignment: .topTrailing) {
+            if model.multiSelection.contains(item.id) {
+                Image(systemName: "checkmark.circle.fill")
+                    .font(.system(size: 13))
+                    .foregroundStyle(Color.white, Color.accentColor)
+                    .padding(3)
+            }
+        }
     }
 }
 
@@ -951,6 +1030,10 @@ struct ItemContextMenu: View {
     var body: some View {
         Button("粘贴") { model.selectedID = item.id; model.pasteSelected() }
         Button("复制到剪贴板") { model.selectedID = item.id; model.copySelectedToList() }
+        // 富文本条目粘贴时默认带格式，这个入口给"就要素文本"的时刻
+        if item.kind == .text || item.kind == .link || item.kind == .color {
+            Button("复制为纯文本") { model.copyAsPlainText(item) }
+        }
         if item.kind == .image {
             Button("OCR 文字到剪贴板") { model.ocrToClipboard(item) }
         }

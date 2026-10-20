@@ -87,7 +87,7 @@ final class StatusItemController: NSObject {
             button.title = "BP"
             button.imagePosition = .noImage
         } else {
-            button.image = Self.statusImage(squash: 1)
+            refreshIcon()
             button.imagePosition = .imageOnly
         }
         button.target = self
@@ -125,7 +125,8 @@ final class StatusItemController: NSObject {
             self.animationStep += 1
             if self.animationStep >= self.frames.count {
                 timer.invalidate()
-                self.statusItem.button?.image = Self.statusImage(squash: 1)
+                // 用 refreshIcon 而不是直接画普通图标：暂停态下翻完要回到暂停图标
+                self.refreshIcon()
                 self.animationTimer = nil
                 return
             }
@@ -206,7 +207,9 @@ final class StatusItemController: NSObject {
     /// 菜单栏图标：剪贴板轮廓 + 顶部夹子 + 两条内容行。
     /// 用 template（isTemplate = true）交给系统着色，明暗菜单栏都自动适配。
     /// `-squash`（scaleBy 为负）就是水平镜像，一帧画出"背面"。
-    private static func statusImage(squash: CGFloat, mirrored: Bool = false) -> NSImage {
+    /// paused = true 时内容行换成两根竖条（"暂停"符号），一眼分辨记录状态。
+    private static func statusImage(squash: CGFloat, mirrored: Bool = false,
+                                    paused: Bool = false) -> NSImage {
         let image = NSImage(size: NSSize(width: 18, height: 18), flipped: false) { _ in
             NSColor.black.set()
             if let context = NSGraphicsContext.current?.cgContext {
@@ -226,15 +229,30 @@ final class StatusItemController: NSObject {
             NSBezierPath(roundedRect: NSRect(x: 6.4, y: 13.6, width: 5.2, height: 2.8),
                          xRadius: 1.4, yRadius: 1.4).fill()
 
-            // 内容行
-            for y in [9.6, 6.6] {
-                NSBezierPath(roundedRect: NSRect(x: 6.4, y: y, width: 5.2, height: 1.5),
-                             xRadius: 0.75, yRadius: 0.75).fill()
+            if paused {
+                // 暂停态：两根竖条占住内容区（国际通用的"暂停"符号）
+                for x in [6.5, 9.2] {
+                    NSBezierPath(roundedRect: NSRect(x: x, y: 5.2, width: 2.2, height: 7.6),
+                                 xRadius: 0.9, yRadius: 0.9).fill()
+                }
+            } else {
+                // 内容行
+                for y in [9.6, 6.6] {
+                    NSBezierPath(roundedRect: NSRect(x: 6.4, y: y, width: 5.2, height: 1.5),
+                                 xRadius: 0.75, yRadius: 0.75).fill()
+                }
             }
             return true
         }
         image.isTemplate = true
         return image
+    }
+
+    /// 按当前状态重画图标。暂停/恢复记录、翻转动画收尾都走这里，
+    /// 避免动画把暂停图标覆盖回普通图标。
+    func refreshIcon() {
+        guard let button = statusItem.button else { return }
+        button.image = Self.statusImage(squash: 1, paused: model.isPaused)
     }
 
     // ── 菜单 ─────────────────────────────────────────────────
@@ -243,8 +261,18 @@ final class StatusItemController: NSObject {
         let menu = NSMenu()
         // 1.0.9 裁剪：导出/导入在设置页里已有、清空历史放这里太危险
         // （两下误点就没了）、"菜单栏设置"只是排查期的一时之需。
-        // 菜单栏右键菜单留高频三件事：开面板、进设置、退出。
+        // 1.0.15 起加回两个状态开关（用户要求）：暂停记录（隐私模式）、
+        // 记录富文本——都是"看情况切一下"的低频动作，放菜单栏最顺手。
         menu.addItem(item("打开面板", #selector(openPanel)))
+
+        let pauseItem = item(model.isPaused ? "恢复记录" : "暂停记录", #selector(togglePaused))
+        menu.addItem(pauseItem)
+
+        let richItem = item("记录富文本", #selector(toggleCaptureRichText))
+        richItem.state = model.prefs.value.captureRichText ? .on : .off
+        menu.addItem(richItem)
+
+        menu.addItem(.separator())
         menu.addItem(item("设置…", #selector(openSettings)))
         menu.addItem(.separator())
         menu.addItem(item("关于 BoxPaste", #selector(showAbout)))
@@ -260,8 +288,11 @@ final class StatusItemController: NSObject {
 
     @objc private func handleClick(_ sender: Any?) {
         if NSApp.currentEvent?.type == .rightMouseUp {
+            // 每次右键都重建菜单：暂停/富文本两个开关的标题与勾选态必须实时，
+            // 常驻的旧菜单会把上一次的状态一直挂着。
             // 临时挂上菜单再点一次，是状态栏项出右键菜单的标准做法：
             // 常驻 menu 会把左键也吃掉。
+            menu = buildMenu()
             statusItem.menu = menu
             statusItem.button?.performClick(nil)
             statusItem.menu = nil
@@ -272,6 +303,12 @@ final class StatusItemController: NSObject {
 
     @objc private func openPanel() { model.onRequestShowPanel?() }
     @objc private func openSettings() { model.onRequestShowSettings?() }
+    @objc private func togglePaused() { model.togglePaused() }
+    @objc private func toggleCaptureRichText() {
+        // 写偏好而不直改监听器：didChange → applyPreferences 会同步过去，
+        // 状态只维护一处（重新启动后也自然恢复上次的选择）。
+        model.prefs.value.captureRichText.toggle()
+    }
 
     /// 把用户送到「系统设置 → 菜单栏」。这是 26 上唯一能改第三方图标可见性的地方。
     static func openMenuBarSettings() {
@@ -398,6 +435,9 @@ final class PanelController: NSObject, NSWindowDelegate {
         model.searchFocused = false
         model.query = ""
         model.hint = nil
+        // 多选是"当下要批量操作"的临时状态，面板一收就该作废，
+        // 不然下次呼出还挂着一堆勾选，让人摸不着头脑。
+        model.clearMultiSelection()
         rememberGeometry()
     }
 
@@ -530,8 +570,9 @@ final class PanelController: NSObject, NSWindowDelegate {
         // 3) 固定键
         switch Int(event.keyCode) {
         case kVK_Escape:
-            // 逐层退出：预览 → 快捷键帮助 → 搜索词 → 面板
-            if model.isPreviewing { model.isPreviewing = false }
+            // 逐层退出：多选 → 预览 → 快捷键帮助 → 搜索词 → 面板
+            if !model.multiSelection.isEmpty { model.clearMultiSelection() }
+            else if model.isPreviewing { model.isPreviewing = false }
             else if model.showsShortcutHelp { model.showsShortcutHelp = false }
             else if !model.query.isEmpty { model.query = "" }
             else { hide() }
@@ -554,17 +595,35 @@ final class PanelController: NSObject, NSWindowDelegate {
         default: break
         }
 
+        // 3.5) ⌥组合：视图切换（原来在 ⌘1/2/3 上，⌘1-9 让位给快捷粘贴后挪到这里）
+        if event.modifierFlags.contains(.option), !event.modifierFlags.contains(.command) {
+            switch Int(event.keyCode) {
+            case kVK_ANSI_1: model.setViewMode(.grid); return nil
+            case kVK_ANSI_2: model.setViewMode(.compact); return nil
+            case kVK_ANSI_3: model.setViewMode(.rich); return nil
+            default: break
+            }
+        }
+
         // 4) ⌘ 组合
         if event.modifierFlags.contains(.command) {
+            // ⌘1-9 = 直接粘贴列表第 N 条（Maccy 的习惯键位）
+            let digitKeys: [Int: Int] = [
+                kVK_ANSI_1: 1, kVK_ANSI_2: 2, kVK_ANSI_3: 3, kVK_ANSI_4: 4,
+                kVK_ANSI_5: 5, kVK_ANSI_6: 6, kVK_ANSI_7: 7, kVK_ANSI_8: 8, kVK_ANSI_9: 9,
+            ]
             switch Int(event.keyCode) {
             case kVK_ANSI_F:     model.searchFocused = true; return nil
             case kVK_ANSI_L:     model.query = ""; return nil
             case kVK_ANSI_Z:     model.undoLastDelete(); return nil
-            case kVK_ANSI_1:     model.setViewMode(.grid); return nil
-            case kVK_ANSI_2:     model.setViewMode(.compact); return nil
-            case kVK_ANSI_3:     model.setViewMode(.rich); return nil
+            case kVK_ANSI_A:     model.selectAllForMultiSelection(); return nil
             case kVK_ANSI_Comma: model.onRequestShowSettings?(); return nil
-            default:             return event
+            default:
+                if let position = digitKeys[Int(event.keyCode)] {
+                    model.quickPaste(at: position)
+                    return nil
+                }
+                return event
             }
         }
 

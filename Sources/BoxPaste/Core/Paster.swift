@@ -48,7 +48,18 @@ enum Paster {
         var ok = true
         switch item.kind {
         case .text, .link, .color:
+            // 纯文本永远给：它是兜底，任何目标应用都认
             ok = pasteboard.setString(item.text, forType: .string)
+            // 富文本还原：捕获时存过档就一并挂上（RTF 给文字处理软件、
+            // HTML 给浏览器类）。某个存档文件丢了就静默跳过，不影响纯文本。
+            if let name = item.rtfBlobName,
+               let rtf = try? Data(contentsOf: store.blobURL(named: name)) {
+                pasteboard.setData(rtf, forType: .rtf)
+            }
+            if let name = item.htmlBlobName,
+               let html = try? Data(contentsOf: store.blobURL(named: name)) {
+                pasteboard.setData(html, forType: .html)
+            }
 
         case .image:
             guard let url = store.imageURL(for: item), let data = try? Data(contentsOf: url) else { return false }

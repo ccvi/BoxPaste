@@ -42,6 +42,7 @@ enum SelfTest {
         storeTests()
         ruleTests()
         importExportTests()
+        richTextTests()
         shortcutTests()
         preferenceTests()
         formatTests()
@@ -263,6 +264,76 @@ enum SelfTest {
         check(ClipboardWatcher.thumbnailName(for: "") == nil, "空 blob 名没有缩略图")
     }
 
+    // ── 富文本存档 ────────────────────────────────────────────
+
+    private static func richTextTests() {
+        // 用真的系统剪贴板构造一份带 RTF 的内容（自检本来就允许碰剪贴板，
+        // Paster 的降级测试同样用它），attachRichText 从这里取存档。
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString("带格式的正文", forType: .string)
+        let rtf = Data("{\\rtf1\\ansi 带格式的正文}".utf8)
+        pasteboard.setData(rtf, forType: .rtf)
+
+        let root = temporaryRoot("rich")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = ClipStore(root: root)
+
+        var item = ClipboardWatcher.textItem("带格式的正文")
+        ClipboardWatcher.attachRichText(to: &item, from: pasteboard, store: store, maxBytes: 1024)
+        check(item.rtfBlobName != nil, "富文本：RTF 被存档")
+        check(item.htmlBlobName == nil, "富文本：剪贴板没有 HTML 时该字段为空")
+        if let name = item.rtfBlobName {
+            check(FileManager.default.fileExists(atPath: store.blobURL(named: name).path),
+                  "富文本：存档文件真的写进了 blobs/")
+        }
+
+        // 去重刷新要继承旧存档：后来的一次捕获没带富文本时不能把存档抹掉
+        _ = store.insert(item, maxItems: 100)
+        _ = store.insert(ClipboardWatcher.textItem("带格式的正文"), maxItems: 100)
+        equal(store.items.count, 1, "富文本条目同内容去重")
+        check(store.items[0].rtfBlobName != nil, "去重刷新保留旧富文本存档")
+
+        // 落盘往返：新增的可选字段要能存能读（旧历史文件没有该字段 → nil）
+        store.save()
+        let reloaded = ClipStore(root: root)
+        reloaded.load()
+        equal(reloaded.items.first?.rtfBlobName, item.rtfBlobName, "富文本字段落盘往返")
+
+        // 删除条目连带清理富文本存档（不然 blobs/ 里全是孤儿文件）
+        let storedName = item.rtfBlobName!
+        let id = reloaded.items[0].id
+        reloaded.remove(ids: [id])
+        check(!FileManager.default.fileExists(atPath: reloaded.blobURL(named: storedName).path),
+              "删除文本条目连带清理富文本存档")
+
+        // 导出 → 导入：存档要跟着条目走
+        let srcRoot = temporaryRoot("rich-export-src")
+        let dstRoot = temporaryRoot("rich-export-dst")
+        defer {
+            try? FileManager.default.removeItem(at: srcRoot)
+            try? FileManager.default.removeItem(at: dstRoot)
+        }
+        let source = ClipStore(root: srcRoot)
+        var richItem = ClipboardWatcher.textItem("导出带格式")
+        ClipboardWatcher.attachRichText(to: &richItem, from: pasteboard, store: source, maxBytes: 1024)
+        _ = source.insert(richItem, maxItems: 100)
+        guard let data = try? source.exportData(appVersion: "selftest") else {
+            check(false, "富文本导出")
+            return
+        }
+        let target = ClipStore(root: dstRoot)
+        let added = (try? target.importData(data)) ?? -1
+        equal(added, 1, "富文本导入条数")
+        if let restored = target.items.first {
+            check(restored.rtfBlobName != nil, "富文本导入后字段保留")
+            if let name = restored.rtfBlobName {
+                check(FileManager.default.fileExists(atPath: target.blobURL(named: name).path),
+                      "富文本存档随导入还原成文件")
+            }
+        }
+    }
+
     // ── 快捷键 ───────────────────────────────────────────────
 
     private static func shortcutTests() {
@@ -304,6 +375,7 @@ enum SelfTest {
             // 1.0.3 之前写出来的配置里没有这个键。解码器要给它补默认值，
             // 而不是把整份设置判为损坏（那会让升级=设置全丢）。
             equal(decoded.alwaysOnTop, false, "缺失的置顶开关落回 false")
+            equal(decoded.captureRichText, true, "缺失的富文本开关落回 true")
         } else {
             check(false, "旧配置可解码", detail: "字段缺失导致整份解码失败")
         }

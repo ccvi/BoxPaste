@@ -86,12 +86,25 @@ final class ClipStore {
     }
 
     func load() {
-        guard let data = try? Data(contentsOf: historyURL),
-              let decoded = try? makeDecoder().decode([ClipItem].self, from: data) else {
-            items = []
-            return
+        items = Self.readItems(root: root)
+    }
+
+    /// 从磁盘读条目。**静态纯函数**：只碰磁盘与解码、不碰 self，
+    /// 所以能整个放到后台线程跑（启动路径异步化的关键），主线程只负责收结果。
+    /// 日期策略必须与 makeDecoder() 一致（iso8601），否则旧历史整份读不出来。
+    static func readItems(root: URL) -> [ClipItem] {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        guard let data = try? Data(contentsOf: root.appendingPathComponent("history.json")),
+              let decoded = try? decoder.decode([ClipItem].self, from: data) else {
+            return []
         }
-        items = decoded
+        return decoded
+    }
+
+    /// 把后台读出来的条目装进仓库（配合 readItems 使用）。
+    func applyLoaded(_ loaded: [ClipItem]) {
+        items = loaded
     }
 
     func save() {
@@ -118,6 +131,10 @@ final class ClipStore {
             // 来源应用换成最近一次复制它的应用：用户感知里"这条来自 A"更符合直觉
             existing.sourceAppName = item.sourceAppName ?? existing.sourceAppName
             existing.sourceBundleID = item.sourceBundleID ?? existing.sourceBundleID
+            // 富文本存档同样沿用旧值：去重命中的新捕获可能没带富文本
+            // （开关关着、或老条目本来就没有），不能反过来把旧存档抹掉
+            existing.rtfBlobName = item.rtfBlobName ?? existing.rtfBlobName
+            existing.htmlBlobName = item.htmlBlobName ?? existing.htmlBlobName
             // 置顶状态与手动归类沿用旧的（用户手工动作不该被自动流程抹掉）
             items[index] = existing
             enforceLimit(maxItems)
@@ -182,15 +199,20 @@ final class ClipStore {
     }
 
     func deleteBlobs(of item: ClipItem) {
-        guard item.kind == .image else { return }
         let manager = FileManager.default
-        if let blobURL = imageURL(for: item) {
-            try? manager.removeItem(at: blobURL)
-            ThumbnailCache.shared.forget(blobURL)
+        if item.kind == .image {
+            if let blobURL = imageURL(for: item) {
+                try? manager.removeItem(at: blobURL)
+                ThumbnailCache.shared.forget(blobURL)
+            }
+            if let thumbURL = thumbnailURL(for: item) {
+                try? manager.removeItem(at: thumbURL)
+                ThumbnailCache.shared.forget(thumbURL)
+            }
         }
-        if let thumbURL = thumbnailURL(for: item) {
-            try? manager.removeItem(at: thumbURL)
-            ThumbnailCache.shared.forget(thumbURL)
+        // 富文本存档（文本类条目 1.0.15 起可能带）：条目没了存档就是孤儿文件
+        for name in [item.rtfBlobName, item.htmlBlobName].compactMap({ $0 }) {
+            try? manager.removeItem(at: blobURL(named: name))
         }
     }
 
@@ -252,11 +274,17 @@ final class ClipStore {
         var bundle = ExportBundle(app: "BoxPaste", version: appVersion,
                                   exportedAt: Date(), items: items, blobs: [:])
         if embedImages {
-            for item in items where item.kind == .image {
-                guard let url = imageURL(for: item),
-                      let data = try? Data(contentsOf: url),
-                      data.count <= maxEmbedBytes else { continue }
-                bundle.blobs[item.blobName ?? url.lastPathComponent] = data.base64EncodedString()
+            for item in items {
+                // 图像与富文本存档统一走 blobs 字典（名字 → base64），
+                // 导入端只认条目上引用的名字，不区分种类。
+                var names: [String] = []
+                if item.kind == .image { names.append(item.blobName ?? "") }
+                names.append(contentsOf: [item.rtfBlobName, item.htmlBlobName].compactMap { $0 })
+                for name in names where !name.isEmpty {
+                    guard let data = try? Data(contentsOf: blobURL(named: name)),
+                          data.count <= maxEmbedBytes else { continue }
+                    bundle.blobs[name] = data.base64EncodedString()
+                }
             }
         }
         let encoder = makeEncoder()
@@ -290,6 +318,12 @@ final class ClipStore {
                    !FileManager.default.fileExists(atPath: blobURL(named: thumbName).path) {
                     // 缩略图不存在时用原图补一张，省得列表里全是占位图标
                     try? writeBlob(data: blobData, name: thumbName)
+                }
+            }
+            // 富文本存档也一并还原（旧备份文件里没有这两个名字就静默跳过）
+            for name in [item.rtfBlobName, item.htmlBlobName].compactMap({ $0 }) {
+                if let base64 = bundle.blobs[name], let blobData = Data(base64Encoded: base64) {
+                    try? writeBlob(data: blobData, name: name)
                 }
             }
             // 导入的条目不该空降到"最新"，但也不能时间戳为未来：

@@ -39,6 +39,10 @@ final class AppModel: ObservableObject {
     /// 不用这个中间值的话，行内容只在窗口重开时重算，用户勾完授权回来
     /// 看到的还是"未授权"，会以为授权没生效（实测踩过）。
     @Published private(set) var accessibilityGranted = Paster.isAccessibilityTrusted
+    /// 隐私模式：暂停记录剪贴板。会话级状态，重启默认恢复记录。
+    @Published private(set) var isPaused = false
+    /// 多选批量操作：⌘单击逐个勾选，工具条上做批量删除/收藏。
+    @Published var multiSelection: Set<UUID> = []
 
     let store: ClipStore
     let prefs: PreferencesStore
@@ -51,6 +55,8 @@ final class AppModel: ObservableObject {
     var onRequestShowSettings: (() -> Void)?
     /// 状态栏图标翻转
     var onCopyFeedback: (() -> Void)?
+    /// 状态栏图标状态变化（暂停/恢复记录）后重绘
+    var onIconStateChanged: (() -> Void)?
     /// 粘贴前把焦点还给"上一个外部应用"
     var onReactivatePreviousApp: (() -> Void)?
     /// 粘贴目标（上一个外部应用）。AppDelegate 把 panel.pasteTarget 接过来，
@@ -60,6 +66,9 @@ final class AppModel: ObservableObject {
     private var hintTask: DispatchWorkItem?
     private var undoStack: [[ClipItem]] = []
     private var accessibilityObserver: NSObjectProtocol?
+    /// 历史是否已从磁盘装载完成。没装载完之前**不许** save()——
+    /// 否则空仓库会把磁盘上的真实历史整个覆盖掉。
+    private var historyLoaded = false
 
     var appVersion: String {
         Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0.0"
@@ -77,16 +86,13 @@ final class AppModel: ObservableObject {
     }
 
     func bootstrap() {
-        store.load()
-        store.enforceLimit(prefs.value.maxItems)
-        refresh()
+        // ① 先把不依赖历史的装配做完：热键、授权监听、设置回调。
+        //    面板在历史装载完成前也能打开（列表短暂为空，装载完自动补上）。
         viewMode = prefs.value.defaultView
 
         watcher.onCapture = { [weak self] item in
             self?.handleCapture(item)
         }
-        watcher.start(interval: prefs.value.pollInterval,
-                      ignoreConcealed: prefs.value.ignoreConcealed)
 
         prefs.didChange = { [weak self] old, new in
             self?.applyPreferences(from: old, to: new)
@@ -110,6 +116,34 @@ final class AppModel: ObservableObject {
             }
         }
         RunLoop.main.add(poll, forMode: .common)
+
+        // ② 历史装载放后台：条数多时解码有几十毫秒级开销，不该挡在启动路径上。
+        //    读盘是纯函数（ClipStore.readItems），后台跑完回主线程赋值。
+        // ③ 监听器等装载完成再启动：启动时"补收当前剪贴板"要落在真实历史上，
+        //    不能先收进空仓库、再被装载结果整个覆盖。
+        let root = store.root
+        Task.detached(priority: .userInitiated) { [weak self] in
+            let loaded = ClipStore.readItems(root: root)
+            await MainActor.run { self?.historyDidLoad(loaded) }
+        }
+    }
+
+    /// 后台装载完成：装数、收敛上限、补装监听器。见 bootstrap 的顺序注释。
+    private func historyDidLoad(_ loaded: [ClipItem]) {
+        store.applyLoaded(loaded)
+        // 万一装载完成前就往空仓库塞了东西（呼出即拖入这种毫秒级窗口），
+        // 按 hash 去重拼回去，别让用户拖的那条凭空消失。
+        for pending in store.items where loaded.contains(where: { $0.hash == pending.hash }) == false {
+            store.insert(pending, maxItems: prefs.value.maxItems)
+        }
+        historyLoaded = true
+        store.enforceLimit(prefs.value.maxItems)
+        refresh()
+
+        watcher.captureRichText = prefs.value.captureRichText
+        watcher.paused = isPaused
+        watcher.start(interval: prefs.value.pollInterval,
+                      ignoreConcealed: prefs.value.ignoreConcealed)
     }
 
     /// 重新读一次授权状态；变了就更新（驱动设置页重绘）并给一句确认提示。
@@ -129,12 +163,18 @@ final class AppModel: ObservableObject {
             DistributedNotificationCenter.default.removeObserver(accessibilityObserver)
         }
         watcher.stop()
-        store.save()
+        // 历史还没装载完就退出（启动即杀）时绝不能 save：
+        // 空仓库写下去等于把磁盘上的真实历史清空。
+        if historyLoaded { store.save() }
     }
 
     private func applyPreferences(from old: Preferences, to new: Preferences) {
         if old.pollInterval != new.pollInterval || old.ignoreConcealed != new.ignoreConcealed {
             watcher.updateInterval(new.pollInterval, ignoreConcealed: new.ignoreConcealed)
+        }
+        if old.captureRichText != new.captureRichText {
+            // 菜单栏开关走的也是这条路：改偏好 → didChange → 这里同步给监听器
+            watcher.captureRichText = new.captureRichText
         }
         if old.shortcuts != new.shortcuts {
             registerGlobalHotKeys()
@@ -318,6 +358,95 @@ final class AppModel: ObservableObject {
     /// 网格视图里左右移动要按列跳；列数由视图算好后传进来。
     func moveSelectionHorizontally(by offset: Int, columns: Int) {
         moveSelection(by: offset * max(columns, 1))
+    }
+
+    // ── 隐私模式 ─────────────────────────────────────────────
+
+    /// 暂停/恢复记录。只切监听器标志 + 通知图标重绘，不落盘：
+    /// 重启默认恢复记录是刻意的（见 ClipboardWatcher.paused 的注释）。
+    func togglePaused() {
+        isPaused.toggle()
+        watcher.paused = isPaused
+        onIconStateChanged?()
+        showHint(isPaused ? "已暂停记录：这期间的复制不进历史"
+                          : "已恢复记录")
+    }
+
+    // ── 多选批量操作 ─────────────────────────────────────────
+
+    func toggleMultiSelect(_ id: UUID) {
+        if multiSelection.contains(id) {
+            multiSelection.remove(id)
+        } else {
+            multiSelection.insert(id)
+        }
+    }
+
+    func clearMultiSelection() {
+        guard !multiSelection.isEmpty else { return }
+        multiSelection = []
+    }
+
+    func selectAllForMultiSelection() {
+        multiSelection = Set(flatVisibleItems.map(\.id))
+    }
+
+    /// 批量删除：整体进撤销栈，⌘Z 一次全回来。
+    func deleteMultiSelection() {
+        guard !multiSelection.isEmpty else { return }
+        let ids = Array(multiSelection)
+        let removed = store.remove(ids: ids)
+        store.save()
+        undoStack.append(removed)
+        if undoStack.count > 20 { undoStack.removeFirst() }
+        multiSelection = []
+        refresh()
+        ensureValidSelection()
+        showHint("已删除 \(removed.count) 项（⌘Z 撤销）")
+    }
+
+    /// 批量加入收藏（已收藏的自动跳过，不报错）。
+    func addMultiSelectionToFavorites() {
+        guard !multiSelection.isEmpty, let fav = defaultCategoryID else { return }
+        var added = 0
+        for id in multiSelection {
+            guard let item = items.first(where: { $0.id == id }) else { continue }
+            var ids = item.manualCategoryIDs
+            guard !ids.contains(fav) else { continue }
+            ids.append(fav)
+            store.setManualCategories(ids, for: id)
+            added += 1
+        }
+        store.save()
+        refresh()
+        showHint(added > 0 ? "已把 \(added) 项加入收藏" : "所选内容都已在收藏里")
+    }
+
+    // ── 快捷位置粘贴 ─────────────────────────────────────────
+
+    /// ⌘1-9 直接粘贴列表第 N 条。N 按**当前显示顺序**算：置顶、搜索过滤
+    /// 都算在内——眼睛看到的第一条就是 ⌘1，不用换算。
+    func quickPaste(at position: Int) {
+        let visible = flatVisibleItems
+        guard position >= 1, position <= visible.count else { return }
+        selectedID = visible[position - 1].id
+        pasteSelected()
+    }
+
+    /// 只把纯文本写回剪贴板（右键「复制为纯文本」）。
+    /// 富文本条目粘贴时默认带格式，这个入口给"就要素文本"的时刻。
+    func copyAsPlainText(_ item: ClipItem) {
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(item.text, forType: .string)
+        // 我们自己的写回，监听器要忽略（不然纯文本会作为新条目混进历史）
+        watcher.ignore(changeCount: pasteboard.changeCount)
+        store.bump(item.id)
+        store.save()
+        refresh()
+        SoundFeedback.playCopyFeedback(enabled: prefs.value.playSound,
+                                             soundName: prefs.value.feedbackSound)
+        showHint("已复制纯文本")
     }
 
     // ── 条目操作 ─────────────────────────────────────────────

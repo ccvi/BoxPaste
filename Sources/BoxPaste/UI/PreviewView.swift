@@ -21,6 +21,8 @@ struct PreviewOverlayView: View {
     @State private var previewImage: NSImage?
     @State private var previewPixelSize: (Int, Int)?
     @State private var previewLoadFailed = false
+    // 富文本条目的 RTF 渲染结果（后台解析，主线程只收成品）
+    @State private var richPreview: NSAttributedString?
 
     var body: some View {
         ZStack {
@@ -144,16 +146,48 @@ struct PreviewOverlayView: View {
     @ViewBuilder
     private var textContent: some View {
         VStack(alignment: .leading, spacing: 8) {
-            // 文本预览开选择：用户经常需要在预览里挑一段再复制
-            Text(item.text)
-                .font(.system(size: 12))
-                .textSelection(.enabled)
-                .fixedSize(horizontal: false, vertical: true)
-                .frame(maxWidth: .infinity, alignment: .leading)
+            if item.rtfBlobName != nil {
+                richTextContent
+            } else {
+                plainTextContent
+            }
             Text("\(item.text.count) 字符 · \(item.text.split(separator: "\n", omittingEmptySubsequences: false).count) 行 · \(Support.humanByteCount(item.byteCount))")
                 .font(.system(size: 10))
                 .foregroundStyle(.tertiary)
         }
+        .task(id: item.id) {
+            // 换了条目或重开预览都重新解析一遍 RTF
+            richPreview = nil
+            guard let name = item.rtfBlobName,
+                  let data = try? Data(contentsOf: model.store.blobURL(named: name)) else { return }
+            let loaded = await Task.detached(priority: .userInitiated) { () -> NSAttributedString? in
+                NSAttributedString(rtf: data, documentAttributes: nil)
+            }.value
+            guard !Task.isCancelled else { return }
+            richPreview = loaded
+        }
+    }
+
+    /// RTF 渲染失败/没有存档时的兜底：退回纯文本，预览不该开天窗
+    @ViewBuilder
+    private var richTextContent: some View {
+        if let rich = richPreview,
+           let converted = try? AttributedString(rich, including: \.appKit) {
+            Text(converted)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        } else {
+            plainTextContent
+        }
+    }
+
+    private var plainTextContent: some View {
+        // 文本预览开选择：用户经常需要在预览里挑一段再复制
+        Text(item.text)
+            .font(.system(size: 12))
+            .textSelection(.enabled)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     @ViewBuilder
