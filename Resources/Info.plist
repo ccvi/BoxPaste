@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  BoxPaste 的 Info.plist 模板。
+
+  版本号留 __BOXPASTE_VERSION__ / __BOXPASTE_BUILD__ 占位符，由 build-app.sh 用
+  VERSION 文件的当前值替换。写死就会和 VERSION 各说各话，而且不会有任何报错——
+  只是用户看到的版本号悄悄错了。
+-->
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>zh_CN</string>
+	<key>CFBundleDisplayName</key>
+	<string>BoxPaste</string>
+	<key>CFBundleExecutable</key>
+	<string>BoxPaste</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>CFBundleIdentifier</key>
+	<!--
+	  ⚠️ 这个值不能随便改回去。旧值 com.pcxx.boxpaste 在 macOS 26 上
+	  因为「直接 exec .app 内的二进制」被系统永久拉黑了状态栏登记，
+	  换成现在这个 id 才恢复 —— 机制与后果见 Core/AppIdentity.swift 的头注释。
+	-->
+	<string>com.pcxx.boxpastemac</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleLocalizations</key>
+	<array>
+		<string>zh_CN</string>
+		<string>en</string>
+	</array>
+	<key>CFBundleName</key>
+	<string>BoxPaste</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>__BOXPASTE_VERSION__</string>
+	<key>CFBundleVersion</key>
+	<string>__BOXPASTE_BUILD__</string>
+
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.utilities</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>14.0</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSHumanReadableCopyright</key>
+	<string>BoxPaste —— 剪贴板历史管理器</string>
+	<key>NSPrincipalClass</key>
+	<string>NSApplication</string>
+
+	<!--
+	  LSUIElement = true：这是个菜单栏工具，启动时**不占 Dock**。
+
+	  注意这只决定"启动那一刻"的身份。应用运行时会按设置里的「在 Dock 中显示图标」
+	  调 NSApp.setActivationPolicy(.regular / .accessory) 动态切换——
+	  也就是说 Dock 图标是运行时可开可关的，不是编译期写死的。
+
+	  另外：不是 .regular 身份时，AppKit 不会自动建主菜单，设置页里的文本框就
+	  按不出 ⌘C / ⌘V / ⌘A。所以 AppDelegate 会程序化地建一份最小主菜单
+	  （App / 编辑 / 窗口），别把那段代码当无用代码删掉。
+	-->
+	<key>LSUIElement</key>
+	<true/>
+
+	<key>NSSupportsAutomaticTermination</key>
+	<false/>
+	<key>NSSupportsSuddenTermination</key>
+	<false/>
+</dict>
+</plist>
