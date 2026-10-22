@@ -299,8 +299,32 @@ struct HintBar: View {
 struct MultiSelectBar: View {
     @EnvironmentObject var model: AppModel
 
+    /// 是否已处于全选状态：勾选框「打勾」的依据。
+    /// 数量相等才算——条目增删后多选集合与可见列表重新对齐。
+    private var isAllSelected: Bool {
+        let visible = model.flatVisibleItems
+        return !visible.isEmpty && model.multiSelection.count == visible.count
+    }
+
     var body: some View {
         HStack(spacing: 10) {
+            // 全选勾选框（用户指定）：勾上=全选当前列表，取消=清空选择。
+            // 和「已选 N 项」并排，是这根工具条的总开关。
+            Button {
+                if isAllSelected {
+                    model.clearMultiSelection()
+                } else {
+                    model.selectAllForMultiSelection()
+                }
+            } label: {
+                Image(systemName: isAllSelected ? "checkmark.square.fill" : "square")
+                    .font(.system(size: 14))
+                    .foregroundStyle(isAllSelected ? Color.accentColor : Color.secondary)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(isAllSelected ? "取消全选" : "全选")
+
             Text("已选 \(model.multiSelection.count) 项")
                 .font(.system(size: 12, weight: .medium))
                 .monospacedDigit()

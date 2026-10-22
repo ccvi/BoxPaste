@@ -162,7 +162,7 @@ enum ShortcutAction: String, Codable, CaseIterable, Identifiable {
     static let fixedShortcuts: [(keys: String, action: String)] = [
         ("↑ ↓", "上下选择（← → 在网格视图里左右移动）"),
         ("Home / End", "跳到第一项 / 最后一项"),
-        ("⌘1-9", "直接粘贴列表第 1-9 条"),
+        ("⌘1-9", "直接粘贴列表第 1-9 条（置顶的不算编号）"),
         ("⌥1 / ⌥2 / ⌥3", "网格 / 简洁列表 / 丰富列表"),
         ("⌘F", "聚焦搜索框（只有聚焦后空格才算搜索词里的字符）"),
         ("⌘L", "清空搜索"),

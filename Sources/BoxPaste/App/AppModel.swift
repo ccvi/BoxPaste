@@ -424,10 +424,12 @@ final class AppModel: ObservableObject {
 
     // ── 快捷位置粘贴 ─────────────────────────────────────────
 
-    /// ⌘1-9 直接粘贴列表第 N 条。N 按**当前显示顺序**算：置顶、搜索过滤
-    /// 都算在内——眼睛看到的第一条就是 ⌘1，不用换算。
+    /// ⌘1-9 直接粘贴列表第 N 条。N 按**当前显示顺序**算，但**置顶的不算**
+    /// （用户指定）：置顶区是常驻的"固定块"，快捷位置粘贴服务的是
+    /// "刚复制的那几条"，让置顶行占掉 ⌘1-3 等于把编号推下去还不固定。
+    /// 搜索结果里置顶条目同样跳过编号（但仍可点选、回车粘贴）。
     func quickPaste(at position: Int) {
-        let visible = flatVisibleItems
+        let visible = flatVisibleItems.filter { !$0.pinned }
         guard position >= 1, position <= visible.count else { return }
         selectedID = visible[position - 1].id
         pasteSelected()
