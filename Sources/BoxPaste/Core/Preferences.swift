@@ -122,6 +122,11 @@ struct Preferences: Codable, Equatable {
         animateStatusIcon = try container.decodeIfPresent(Bool.self, forKey: .animateStatusIcon) ?? fallback.animateStatusIcon
         playSound = try container.decodeIfPresent(Bool.self, forKey: .playSound) ?? fallback.playSound
         feedbackSound = try container.decodeIfPresent(String.self, forKey: .feedbackSound) ?? fallback.feedbackSound
+        // 音效清单换过一轮（Sosumi/Submarine 下线）：旧值不在当前清单里就落回默认，
+        // 否则设置页的 Picker 会因为选中项不存在而显示空白。
+        if !SoundFeedback.availableNames.contains(feedbackSound) {
+            feedbackSound = fallback.feedbackSound
+        }
         autoPaste = try container.decodeIfPresent(Bool.self, forKey: .autoPaste) ?? fallback.autoPaste
         pollInterval = try container.decodeIfPresent(Double.self, forKey: .pollInterval) ?? fallback.pollInterval
         ignoreConcealed = try container.decodeIfPresent(Bool.self, forKey: .ignoreConcealed) ?? fallback.ignoreConcealed

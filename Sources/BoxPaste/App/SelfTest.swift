@@ -455,6 +455,16 @@ enum SelfTest {
             check(false, "含旧 Dock 键的配置可解码")
         }
 
+        // 下线的音效（Sosumi/Submarine）要落回默认，否则 Picker 显示空白
+        let retiredSound = Data("{\"feedbackSound\": \"Sosumi\"}".utf8)
+        if let decoded = try? JSONDecoder().decode(Preferences.self, from: retiredSound) {
+            equal(decoded.feedbackSound, Preferences().feedbackSound, "下线音效落回默认音色")
+        } else {
+            check(false, "含下线音效的配置可解码")
+        }
+        check(SoundFeedback.availableNames.contains(Preferences().feedbackSound),
+              "默认音色在当前音效清单里")
+
         categoryOrderTests()
         identityTests()
     }

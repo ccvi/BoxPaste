@@ -10,15 +10,24 @@ import AppKit
 
 enum SoundFeedback {
 
-    /// 可选的提示音（用户指定这五个，2026-10-16 逐个试听后圈定）。
+    /// 可选的提示音（2026-10-22 用户试听后圈定这 8 个；
+    /// 上一版的 Sosumi / Submarine 已下线）。
     /// name 是系统音效文件名（/System/Library/Sounds/*.aiff 去扩展名）。
+    /// 顺序按字母排：设置页的选择器照这个顺序展示，排序本身就是一种"好找"。
     static let options: [(name: String, title: String)] = [
+        ("Blow", "气声轻吹"),
+        ("Bottle", "空瓶脆响"),
+        ("Funk", "节奏拨弦"),
         ("Glass", "玻璃轻响"),
-        ("Purr", "轻柔低鸣"),
+        ("Hero", "英雄上扬"),
+        ("Morse", "电报脉冲"),
         ("Ping", "清脆叮声"),
-        ("Sosumi", "轻快弹跳"),
-        ("Submarine", "声呐低鸣"),
+        ("Purr", "轻柔低鸣"),
     ]
+
+    /// 当前可用的音效名集合。设置页读到不在这个集合里的旧值时要落回默认，
+    /// 否则 Picker 会显示空白（旧版本的 Sosumi/Submarine 就是这种存量）。
+    static var availableNames: Set<String> { Set(options.map(\.name)) }
 
     /// 每个音效各自缓存：切换音效后来回试听不重复加载，
     /// 每次 NSSound(named:) 有几十毫秒延迟，反馈讲究即时。

@@ -276,6 +276,9 @@ final class StatusItemController: NSObject {
         menu.addItem(item("设置…", #selector(openSettings)))
         menu.addItem(.separator())
         menu.addItem(item("关于 BoxPaste", #selector(showAbout)))
+        // 帮助放在「关于」下面（用户指定位置）。文档本身随包分发
+        // （Resources/Help.html → Contents/Resources/Help.html），离线可看。
+        menu.addItem(item("使用帮助", #selector(openHelp)))
         menu.addItem(item("退出 BoxPaste", #selector(quit), key: "q"))
         return menu
     }
@@ -316,6 +319,23 @@ final class StatusItemController: NSObject {
         NSWorkspace.shared.open(url)
     }
     @objc private func showAbout() { NSApp.orderFrontStandardAboutPanel(nil) }
+
+    /// 打开随包分发的帮助文档（系统默认浏览器渲染 HTML）。
+    /// 裸二进制（.build 下跑自检/诊断）没有 bundle resources，这时退回
+    /// 仓库里的源文件路径，方便开发时也点得开。
+    @objc private func openHelp() {
+        if let url = Bundle.main.url(forResource: "Help", withExtension: "html") {
+            NSWorkspace.shared.open(url)
+            return
+        }
+        let source = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent("Resources/Help.html")
+        if FileManager.default.fileExists(atPath: source.path) {
+            NSWorkspace.shared.open(source)
+        } else {
+            model.showHint("找不到帮助文档（Help.html 未随包分发）", seconds: 4)
+        }
+    }
     @objc private func quit() { NSApp.terminate(nil) }
 }
 

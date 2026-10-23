@@ -258,6 +258,14 @@ if [[ "$ICON_READY" == "1" ]]; then
 else
     echo "  ⚠ 图标生成失败，使用系统默认图标（不影响功能）"
 fi
+
+# 帮助文档：「使用帮助」菜单项从 Bundle 里读它，漏拷等于入口点了没反应
+if [[ -f "$PROJECT_ROOT/Resources/Help.html" ]]; then
+    cp "$PROJECT_ROOT/Resources/Help.html" "$RESOURCES_DIR/Help.html"
+    echo "  ✓ Help.html（帮助文档）"
+else
+    echo "  ⚠ 缺少 Resources/Help.html，「使用帮助」将不可用" >&2
+fi
 rm -rf "$ICON_TMP"
 
 xattr -cr "$APP_DIR" 2>/dev/null || true
