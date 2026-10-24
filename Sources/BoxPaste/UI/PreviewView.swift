@@ -17,7 +17,8 @@ struct PreviewOverlayView: View {
 
     // 图片异步加载：NSImage(contentsOf:) 主线程同步解码大图，
     // 预览开着时每次重绘都重解一遍，退出时叠加列表重排直接卡死（用户实测）。
-    // 降采样到 1600px：预览区宽不到 500pt，retina 2x 也足够清晰。
+    // 降采样到 1200px：预览区宽不到 500pt，retina 2x 只要 1000px，
+    // 1200 足够清晰又比 1600 少占一半位图内存（1600×1000×4 约 6.4MB）。
     @State private var previewImage: NSImage?
     @State private var previewPixelSize: (Int, Int)?
     @State private var previewLoadFailed = false
@@ -131,7 +132,7 @@ struct PreviewOverlayView: View {
                 return
             }
             let loaded = await Task.detached(priority: .userInitiated) {
-                ImageTools.downsampledImage(at: url, maxPixel: 1600)
+                ImageTools.downsampledImage(at: url, maxPixel: 1200)
             }.value
             guard !Task.isCancelled else { return }
             if let loaded {
@@ -168,10 +169,13 @@ struct PreviewOverlayView: View {
         }
     }
 
-    /// RTF 渲染失败/没有存档时的兜底：退回纯文本，预览不该开天窗
+    /// RTF 渲染失败/没有存档时的兜底：退回纯文本，预览不该开天窗。
+    /// 超长富文本也走这条：排版成本随字符数线性增长，宁可显示截断的纯文本，
+    /// 也不让主线程去排 40 万字符。
     @ViewBuilder
     private var richTextContent: some View {
         if let rich = richPreview,
+           rich.length <= Self.previewCharLimit,
            let converted = try? AttributedString(rich, including: \.appKit) {
             Text(converted)
                 .textSelection(.enabled)
@@ -182,12 +186,63 @@ struct PreviewOverlayView: View {
     }
 
     private var plainTextContent: some View {
-        // 文本预览开选择：用户经常需要在预览里挑一段再复制
-        Text(item.text)
-            .font(.system(size: 12))
-            .textSelection(.enabled)
-            .fixedSize(horizontal: false, vertical: true)
-            .frame(maxWidth: .infinity, alignment: .leading)
+        let capped = Self.cappedPreviewText(item.text)
+        return VStack(alignment: .leading, spacing: 6) {
+            // 提示放最前面：正文有 200 行高，写在末尾等于让人滚到底才看见
+            if let note = capped.note {
+                Text(note)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            // 文本预览开选择：用户经常需要在预览里挑一段再复制
+            Text(capped.body)
+                .font(.system(size: 12))
+                .textSelection(.enabled)
+                // fixedSize 让文本按内容撑高（不然会被 ScrollView 的提案压扁），
+                // 也正因如此，内容长度必须在上游截断，否则就是整篇一次排版。
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    // ── 长文本保护 ───────────────────────────────────────────
+
+    // SwiftUI 的 Text 是整体排版：`.fixedSize(vertical: true)` 会一次量出全部行的
+    // 高度。实测 10000 行 / 40 万字符的纯文本，主线程卡在
+    // ViewLayoutEngine.sizeThatFits 里 60 秒以上、footprint 冲到 101MB，
+    // 最终被系统按内存杀掉（exit 137）。预览只是"看一眼"，所以超过阈值就截断：
+    // 排版高度恒定，再长的内容也是秒开，完整内容照样能粘贴/复制。
+    private static let previewLineLimit = 200
+    private static let previewCharLimit = 20_000
+
+    struct CappedText {
+        let body: String
+        let note: String?
+    }
+
+    static func cappedPreviewText(_ text: String) -> CappedText {
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
+        guard lines.count > previewLineLimit || text.count > previewCharLimit else {
+            return CappedText(body: text, note: nil)
+        }
+        var kept: [String] = []
+        var used = 0
+        for line in lines.prefix(previewLineLimit) {
+            let room = previewCharLimit - used
+            if room <= 0 { break }
+            // 单行超长（压缩包 base64、整篇没换行的 JSON）也要按字符数切
+            if line.count > room {
+                kept.append(String(line.prefix(room)))
+                break
+            }
+            kept.append(String(line))
+            used += line.count + 1        // +1：换行符自己也要占位
+        }
+        let note = "内容过长，预览只显示前 \(kept.count) 行（共 \(lines.count) 行 · \(text.count) 字符）。"
+            + "完整内容请直接粘贴，或点下方「复制」。"
+        return CappedText(body: kept.joined(separator: "\n"), note: note)
     }
 
     @ViewBuilder

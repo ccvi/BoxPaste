@@ -22,7 +22,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // 必须在 AppModel（读偏好）之前做，否则用户会看到一次出厂设置。
         AppIdentity.migrateLegacyDefaultsIfNeeded()
 
-        let model = AppModel()
+        // 诊断用：--store-root <目录> 让这次运行读写一个临时仓库，
+        // --seed-heavy 先往里塞大文本/富文本/大图（见 PerfFixtures）。
+        // 正常启动两个参数都没有，行为完全不变。
+        let diagnosticRoot: URL? = {
+            guard let index = CommandLine.arguments.firstIndex(of: "--store-root"),
+                  CommandLine.arguments.count > index + 1 else { return nil }
+            let root = URL(fileURLWithPath: CommandLine.arguments[index + 1])
+            if CommandLine.arguments.contains("--seed-heavy") {
+                PerfFixtures.seed(into: root)
+            }
+            return root
+        }()
+
+        let model = diagnosticRoot.map { AppModel(store: ClipStore(root: $0)) } ?? AppModel()
         self.model = model
 
         // Dock 策略要在任何窗口出现之前定：先建窗口再切身份，
@@ -77,6 +90,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
+        if CommandLine.arguments.contains("--preview-memory") {
+            // 预览内存诊断：逐条打开/关闭预览，每步打一次 footprint。
+            // 用途是回答"按空格预览之后内存为什么涨上去就不降"这类问题——
+            // 外部 footprint 命令要额外权限，只能从进程内部量。
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+                self?.runPreviewMemoryDiagnostic()
+            }
+        }
+
         if CommandLine.arguments.contains("--show-settings") {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
                 self?.showSettings()
@@ -99,6 +121,67 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         model?.shutdown()
+    }
+
+    // ── 诊断：预览的内存开销 ─────────────────────────────────
+
+    /// 逐条预览 → 收起，各打一次 footprint，结果写 /tmp。
+    /// 关键是要区分「预览期间暂住」和「关掉后不归还」——后者才是要修的。
+    private var previewDiagQueue: [ClipItem] = []
+    private var previewDiagLines: [String] = []
+
+    private func runPreviewMemoryDiagnostic() {
+        previewDiagLines = ["── BoxPaste 预览内存诊断 ──"]
+        model.onRequestShowPanel?()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.recordFootprint("面板已打开（含首次布局）")
+                self.previewDiagQueue = Array(self.model.flatVisibleItems.prefix(20))
+                self.previewDiagStep()
+            }
+        }
+    }
+
+    private func recordFootprint(_ label: String) {
+        previewDiagLines.append(String(format: "%@：%.1f MB", label, Support.physFootprintMB))
+        flushPreviewDiag()
+    }
+
+    /// 逐步落盘：预览大内容时进程可能被系统直接杀掉（jetsam），
+    /// 只在最后写文件的话会一条数据都留不下。
+    private func flushPreviewDiag() {
+        try? (previewDiagLines.joined(separator: "\n") + "\n")
+            .write(toFile: "/tmp/boxpaste-preview-memory.txt", atomically: true, encoding: .utf8)
+    }
+
+    private func previewDiagStep() {
+        guard let item = previewDiagQueue.first else {
+            recordFootprint("全部预览结束（预览均已关闭）")
+            exit(0)
+        }
+        previewDiagQueue.removeFirst()
+        model.selectedID = item.id
+        let before = Support.physFootprintMB
+        model.isPreviewing = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                let during = Support.physFootprintMB
+                self.model.isPreviewing = false
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+                    MainActor.assumeIsolated {
+                        let after = Support.physFootprintMB
+                        self.previewDiagLines.append(String(format:
+                            "  %@ · %d B · 预览前 %.1f → 预览中 %.1f（+%.1f）→ 关闭后 %.1f（残留 +%.1f）",
+                            item.kind.title, item.byteCount,
+                            before, during, during - before, after, after - before))
+                        self.flushPreviewDiag()
+                        self.previewDiagStep()
+                    }
+                }
+            }
+        }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {

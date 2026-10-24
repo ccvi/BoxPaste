@@ -44,6 +44,7 @@ enum SelfTest {
         importExportTests()
         richTextTests()
         imageCaptureTests()
+        previewTests()
         shortcutTests()
         preferenceTests()
         formatTests()
@@ -392,6 +393,38 @@ enum SelfTest {
         if let thumbURL = store.thumbnailURL(for: item) {
             check(FileManager.default.fileExists(atPath: thumbURL.path), "图片条目：缩略图落盘")
         }
+    }
+
+    // ── 预览截断 ─────────────────────────────────────────────
+
+    // 长文本预览的护栏：超过阈值就截断，避免 SwiftUI 一次排版整篇
+    // （10000 行实测会卡死主线程并被系统杀进程）。
+    private static func previewTests() {
+        // 短文本原样显示
+        let short = "本次应用版本号不变。"
+        let cappedShort = PreviewOverlayView.cappedPreviewText(short)
+        equal(cappedShort.body, short, "预览截断：短文本原样")
+        check(cappedShort.note == nil, "预览截断：短文本不提示")
+
+        // 行数超限：只留 200 行，并给出提示
+        let manyLines = (1...300).map { "第 \($0) 行" }.joined(separator: "\n")
+        let cappedLines = PreviewOverlayView.cappedPreviewText(manyLines)
+        equal(cappedLines.body.split(separator: "\n", omittingEmptySubsequences: false).count,
+              200, "预览截断：行数上限 200")
+        check(cappedLines.note != nil, "预览截断：行数超限要提示")
+        check(cappedLines.body.hasPrefix("第 1 行"), "预览截断：保留的是开头")
+
+        // 单行超长（没换行的 JSON / base64）：按字符数切
+        let oneLongLine = String(repeating: "a", count: 30_000)
+        let cappedLine = PreviewOverlayView.cappedPreviewText(oneLongLine)
+        equal(cappedLine.body.count, 20_000, "预览截断：单行按字符上限切")
+        check(cappedLine.note != nil, "预览截断：单行超长要提示")
+
+        // 恰好卡在上限内：不该动
+        let exactly200 = (1...200).map { _ in "x" }.joined(separator: "\n")
+        let cappedEdge = PreviewOverlayView.cappedPreviewText(exactly200)
+        equal(cappedEdge.body, exactly200, "预览截断：200 行整不截断")
+        check(cappedEdge.note == nil, "预览截断：200 行整不提示")
     }
 
     // ── 快捷键 ───────────────────────────────────────────────

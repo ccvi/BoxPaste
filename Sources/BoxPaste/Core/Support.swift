@@ -1,5 +1,6 @@
 import AppKit
 import CryptoKit
+import Darwin
 import Foundation
 
 // ============================================================
@@ -7,6 +8,21 @@ import Foundation
 // ============================================================
 
 enum Support {
+
+    /// 进程自身的物理内存占用（与活动监视器「内存」列同一口径）。
+    /// 诊断用：外部 `footprint` 命令需要额外权限，应用内直接问内核最省事。
+    static var physFootprintMB: Double {
+        var info = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size
+                                           / MemoryLayout<integer_t>.size)
+        let kr = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+            }
+        }
+        guard kr == KERN_SUCCESS else { return 0 }
+        return Double(info.phys_footprint) / 1_000_000
+    }
 
     /// 数据落盘根目录：~/Library/Application Support/BoxPaste
     /// 结构与家族其他项目一致（history.json + blobs/），方便用户自己备份。
