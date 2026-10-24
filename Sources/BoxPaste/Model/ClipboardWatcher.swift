@@ -37,9 +37,19 @@ final class ClipboardWatcher {
     private var timer: Timer?
     private var lastChangeCount: Int
     private var ignoredChangeCounts: Set<Int> = []
-    private var currentInterval: TimeInterval = 0.35
+    /// 基础轮询间隔（设置项）
+    private var baseInterval: TimeInterval = 0.35
+    /// 面板是否开着。开着用基础间隔，收起来就放慢（见 effectiveInterval）
+    private var isActive = false
     private var ignoreConcealed = true
     private var didPrimeClipboard = false
+
+    /// 实际使用的轮询间隔。面板收起时放慢到 2.6 倍（下限 0.8s）：
+    /// 隐藏状态下每秒 3 次的唤醒大多是白跑，省下来对电池有实际意义；
+    /// 呼出面板时会立刻补扫一次（pollNow），不会漏掉刚复制的内容。
+    private var effectiveInterval: TimeInterval {
+        isActive ? baseInterval : max(baseInterval * 2.6, 0.8)
+    }
 
     /// 暂停记录（隐私模式）。true 时轮询照常跑、changeCount 照常登记，
     /// 只是不收内容——这样恢复记录后不会把暂停期间的积压一股脑倒进历史。
@@ -58,7 +68,7 @@ final class ClipboardWatcher {
 
     func start(interval: TimeInterval, ignoreConcealed: Bool) {
         self.ignoreConcealed = ignoreConcealed
-        currentInterval = interval
+        baseInterval = interval
         stop()
 
         // 启动时把当前剪贴板内容也收一条：用户按了热键却发现"刚复制的没在里面"
@@ -72,8 +82,14 @@ final class ClipboardWatcher {
                 emit(item)
             }
         }
+        restartTimer()
+    }
 
-        let timer = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
+    /// 按当前 isActive 重建计时器。改间隔、切面板状态都走这里，
+    /// 避免两处各自拼一遍 Timer 的配置（.common 模式漏了会表现为"拖拽时不记录"）。
+    private func restartTimer() {
+        timer?.invalidate()
+        let timer = Timer(timeInterval: effectiveInterval, repeats: true) { [weak self] _ in
             self?.poll()
         }
         // .common 模式：拖拽输出、菜单弹出时默认模式会暂停，
@@ -87,11 +103,24 @@ final class ClipboardWatcher {
         timer = nil
     }
 
+    /// 面板显隐时切换轮询速度（见 effectiveInterval）。
+    func setActive(_ active: Bool) {
+        guard active != isActive else { return }
+        isActive = active
+        if timer != nil { restartTimer() }
+    }
+
+    /// 立刻扫一遍剪贴板。面板呼出时调用：慢速轮询期间复制的内容
+    /// 不该等到下一拍才出现。
+    func pollNow() {
+        poll()
+    }
+
     func updateInterval(_ interval: TimeInterval, ignoreConcealed: Bool) {
         self.ignoreConcealed = ignoreConcealed
-        guard abs(interval - currentInterval) > 0.001 else { return }
-        currentInterval = interval
-        if timer != nil { start(interval: interval, ignoreConcealed: ignoreConcealed) }
+        guard abs(interval - baseInterval) > 0.001 else { return }
+        baseInterval = interval
+        if timer != nil { restartTimer() }
     }
 
     /// 告诉它"这次变化是我们自己造成的"，跳过。
@@ -177,6 +206,11 @@ final class ClipboardWatcher {
                         hash: Support.sha256("\(kind.rawValue):\(text)"))
     }
 
+    /// 富文本存档的写盘队列（串行，qos 低）：RTF/HTML 可以到 8 MB，
+    /// 放在主线程同步写会在复制大段网页内容时卡一下。
+    private static let blobWriteQueue = DispatchQueue(label: "com.pcxx.boxpaste.blob-write",
+                                                      qos: .utility)
+
     /// 把剪贴板里的 RTF/HTML 存进 blobs/ 并挂到条目上。
     /// 存档名由内容 hash 派生（同文本必然同名），与图像 blob 的命名规则一致。
     /// 抽成静态是因为自检要直接构造假剪贴板跑它，不走轮询。
@@ -185,14 +219,22 @@ final class ClipboardWatcher {
         guard item.kind == .text || item.kind == .link || item.kind == .color else { return }
         if let rtf = pasteboard.data(forType: .rtf), rtf.count <= maxBytes {
             let name = "\(item.hash).rtf"
-            try? store.writeBlob(data: rtf, name: name)
             item.rtfBlobName = name
+            // 名字先挂上、文件稍后到位：万一这毫秒级窗口里就粘贴，
+            // Paster 读不到存档会安静退回纯文本（不会报错），可以接受。
+            blobWriteQueue.async { try? store.writeBlob(data: rtf, name: name) }
         }
         if let html = pasteboard.data(forType: .html), html.count <= maxBytes {
             let name = "\(item.hash).html"
-            try? store.writeBlob(data: html, name: name)
             item.htmlBlobName = name
+            blobWriteQueue.async { try? store.writeBlob(data: html, name: name) }
         }
+    }
+
+    /// 等挂起的存档写盘全部完成。自检专用：断言"文件已落盘"必须等异步写完，
+    /// 正常运行时不需要（读不到就按没有存档处理）。
+    static func flushPendingBlobWrites() {
+        blobWriteQueue.sync {}
     }
 
     static func fileItem(_ urls: [URL]) -> ClipItem {
@@ -213,17 +255,17 @@ final class ClipboardWatcher {
                             blobName: blobName,
                             byteCount: png.count,
                             hash: hash)
-        if let rep = NSBitmapImageRep(data: png) {
-            item.pixelWidth = rep.pixelsWide
-            item.pixelHeight = rep.pixelsHigh
+        // 尺寸与缩略图都走 ImageIO：只解缩略图那一档位图，不碰原尺寸。
+        // 老写法 NSBitmapImageRep(data: png) 会把整张图解出来，复制一张 5K 截图
+        // 的瞬间主线程要卡一下、峰值内存白涨几十 MB（捕获路径的性能热点）。
+        if let probe = ImageTools.probe(png: png, maxPixel: Int(thumbnailMaxSide)) {
+            item.pixelWidth = probe.pixelWidth
+            item.pixelHeight = probe.pixelHeight
+            if let thumb = probe.thumbnailPNG, let name = thumbnailName(for: blobName) {
+                try? store.writeBlob(data: thumb, name: name)
+            }
         }
         try? store.writeBlob(data: png, name: blobName)
-
-        // 缩略图：列表和网格里最多显示到 600 pt，直接用原图会让滚动掉帧
-        if let image = NSImage(data: png), let thumb = thumbnailPNG(from: image, maxSide: thumbnailMaxSide),
-           let name = thumbnailName(for: blobName) {
-            try? store.writeBlob(data: thumb, name: name)
-        }
         return item
     }
 
@@ -251,32 +293,5 @@ final class ClipboardWatcher {
         let base = (blobName as NSString).deletingPathExtension
         let ext = (blobName as NSString).pathExtension
         return "\(base)@thumb.\(ext.isEmpty ? "png" : ext)"
-    }
-
-    static func thumbnailPNG(from image: NSImage, maxSide: CGFloat) -> Data? {
-        let size = image.size
-        guard size.width > 0, size.height > 0 else { return nil }
-        let scale = min(1, maxSide / max(size.width, size.height))
-        let target = NSSize(width: max(1, (size.width * scale).rounded()),
-                            height: max(1, (size.height * scale).rounded()))
-        guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil,
-                                         pixelsWide: Int(target.width),
-                                         pixelsHigh: Int(target.height),
-                                         bitsPerSample: 8,
-                                         samplesPerPixel: 4,
-                                         hasAlpha: true,
-                                         isPlanar: false,
-                                         colorSpaceName: .deviceRGB,
-                                         bytesPerRow: 0,
-                                         bitsPerPixel: 0) else { return nil }
-        NSGraphicsContext.saveGraphicsState()
-        NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
-        NSGraphicsContext.current?.imageInterpolation = .high
-        image.draw(in: NSRect(origin: .zero, size: target),
-                   from: NSRect(origin: .zero, size: size),
-                   operation: .copy,
-                   fraction: 1)
-        NSGraphicsContext.restoreGraphicsState()
-        return rep.representation(using: .png, properties: [:])
     }
 }

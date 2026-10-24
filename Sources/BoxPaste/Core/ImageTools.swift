@@ -56,6 +56,41 @@ enum ImageTools {
         }
         return CGImageSourceCreateImageAtIndex(source, 0, nil)
     }
+
+    struct ImageProbe {
+        let pixelWidth: Int
+        let pixelHeight: Int
+        /// 最长边不超过 maxPixel 的缩略图（PNG 编码后）
+        let thumbnailPNG: Data?
+    }
+
+    /// 从内存里的 PNG 数据取「原始像素尺寸 + 缩略图」，**不做整图解码**。
+    /// 捕获路径专用：老的 NSBitmapImageRep(data:) 会把整张图解成位图
+    /// （一张 5K 截图就是几十 MB），复制瞬间主线程要卡一下、峰值内存也白涨；
+    /// ImageIO 只解缩略图那一档，尺寸从元数据里读。
+    static func probe(png: Data, maxPixel: Int) -> ImageProbe? {
+        guard let source = CGImageSourceCreateWithData(png as CFData,
+                                                       [kCGImageSourceShouldCache: false] as CFDictionary) else {
+            return nil
+        }
+        var pixelWidth = 0, pixelHeight = 0
+        if let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any] {
+            pixelWidth = props["PixelWidth" as CFString] as? Int ?? 0
+            pixelHeight = props["PixelHeight" as CFString] as? Int ?? 0
+        }
+        let thumbOptions: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: max(1, maxPixel),
+        ]
+        var thumbnail: Data?
+        if let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, thumbOptions as CFDictionary) {
+            let rep = NSBitmapImageRep(cgImage: cgImage)
+            thumbnail = rep.representation(using: .png, properties: [:])
+        }
+        guard pixelWidth > 0, pixelHeight > 0 else { return nil }
+        return ImageProbe(pixelWidth: pixelWidth, pixelHeight: pixelHeight, thumbnailPNG: thumbnail)
+    }
 }
 
 // ============================================================

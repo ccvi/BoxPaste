@@ -43,6 +43,7 @@ enum SelfTest {
         ruleTests()
         importExportTests()
         richTextTests()
+        imageCaptureTests()
         shortcutTests()
         preferenceTests()
         formatTests()
@@ -281,6 +282,8 @@ enum SelfTest {
 
         var item = ClipboardWatcher.textItem("带格式的正文")
         ClipboardWatcher.attachRichText(to: &item, from: pasteboard, store: store, maxBytes: 1024)
+        // 存档写盘是异步的（见 attachRichText 的队列注释），断言文件存在前先等它写完
+        ClipboardWatcher.flushPendingBlobWrites()
         check(item.rtfBlobName != nil, "富文本：RTF 被存档")
         check(item.htmlBlobName == nil, "富文本：剪贴板没有 HTML 时该字段为空")
         if let name = item.rtfBlobName {
@@ -317,6 +320,7 @@ enum SelfTest {
         let source = ClipStore(root: srcRoot)
         var richItem = ClipboardWatcher.textItem("导出带格式")
         ClipboardWatcher.attachRichText(to: &richItem, from: pasteboard, store: source, maxBytes: 1024)
+        ClipboardWatcher.flushPendingBlobWrites()
         _ = source.insert(richItem, maxItems: 100)
         guard let data = try? source.exportData(appVersion: "selftest") else {
             check(false, "富文本导出")
@@ -331,6 +335,62 @@ enum SelfTest {
                 check(FileManager.default.fileExists(atPath: target.blobURL(named: name).path),
                       "富文本存档随导入还原成文件")
             }
+        }
+    }
+
+    // ── 图片捕获（ImageIO 探测 + 缩略图）─────────────────────
+
+    private static func imageCaptureTests() {
+        // 造一张 120×60 的纯色 PNG，走真实捕获路径
+        guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 120, pixelsHigh: 60,
+                                         bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
+                                         isPlanar: false, colorSpaceName: .deviceRGB,
+                                         bytesPerRow: 0, bitsPerPixel: 0) else {
+            check(false, "构造测试位图")
+            return
+        }
+        NSGraphicsContext.saveGraphicsState()
+        if let context = NSGraphicsContext(bitmapImageRep: rep) {
+            NSGraphicsContext.current = context
+            NSColor.systemBlue.setFill()
+            NSRect(x: 0, y: 0, width: 120, height: 60).fill()
+        }
+        NSGraphicsContext.restoreGraphicsState()
+        guard let png = rep.representation(using: .png, properties: [:]) else {
+            check(false, "编码测试 PNG")
+            return
+        }
+
+        // 探测：尺寸来自元数据，缩略图最长边不超过 40
+        if let probe = ImageTools.probe(png: png, maxPixel: 40) {
+            equal(probe.pixelWidth, 120, "图片探测：原始宽度")
+            equal(probe.pixelHeight, 60, "图片探测：原始高度")
+            if let thumbData = probe.thumbnailPNG {
+                let thumb = NSBitmapImageRep(data: thumbData)
+                check(max(thumb?.pixelsWide ?? 0, thumb?.pixelsHigh ?? 0) <= 40,
+                      "图片探测：缩略图最长边不超过上限")
+            } else {
+                check(false, "图片探测：缩略图非空")
+            }
+        } else {
+            check(false, "图片探测返回结果", detail: "probe 为 nil")
+        }
+
+        // 捕获：条目尺寸正确，原图与缩略图都落盘
+        let root = temporaryRoot("image")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = ClipStore(root: root)
+        guard let item = ClipboardWatcher.imageItem(png: png, store: store) else {
+            check(false, "图片条目构造")
+            return
+        }
+        equal(item.pixelWidth, 120, "图片条目：宽度来自探测而非整图解码")
+        equal(item.pixelHeight, 60, "图片条目：高度来自探测")
+        if let url = store.imageURL(for: item) {
+            check(FileManager.default.fileExists(atPath: url.path), "图片条目：原图落盘")
+        }
+        if let thumbURL = store.thumbnailURL(for: item) {
+            check(FileManager.default.fileExists(atPath: thumbURL.path), "图片条目：缩略图落盘")
         }
     }
 

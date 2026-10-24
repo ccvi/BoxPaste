@@ -434,6 +434,11 @@ final class PanelController: NSObject, NSWindowDelegate {
             previousApp = front
         }
 
+        // 面板打开这件事要最先告诉模型：收起期间的复制只记了脏标记，
+        // 列表得在选中/分类这些后续动作之前先补齐，否则 ensureValidSelection
+        // 会在空列表上把选中项清掉。
+        model.panelDidShow()
+
         positionWindow()
         // 每次呼出都落在「全部」上（用户指定：默认分类是全部，不是收藏）。
         model.selectedCategoryID = nil
@@ -458,6 +463,8 @@ final class PanelController: NSObject, NSWindowDelegate {
         // 多选是"当下要批量操作"的临时状态，面板一收就该作废，
         // 不然下次呼出还挂着一堆勾选，让人摸不着头脑。
         model.clearMultiSelection()
+        // 收起后列表不再刷新（refresh 只记脏）、轮询放慢，见 AppModel.panelDidHide
+        model.panelDidHide()
         rememberGeometry()
     }
 

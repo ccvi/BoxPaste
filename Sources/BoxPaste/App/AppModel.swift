@@ -69,6 +69,34 @@ final class AppModel: ObservableObject {
     /// 历史是否已从磁盘装载完成。没装载完之前**不许** save()——
     /// 否则空仓库会把磁盘上的真实历史整个覆盖掉。
     private var historyLoaded = false
+    /// 面板是否可见。收起时 refresh 只记脏、不发布 items：
+    /// 隐藏窗口里的 SwiftUI 收到 @Published 变化照样会重算整棵列表，
+    /// 复制频繁时就是纯烧 CPU（见 refresh / panelDidShow）。
+    private var isPanelVisible = false
+    private var itemsDirty = false
+    /// 条目版本号：派生结果（过滤/分区/平铺）缓存的失效依据
+    private var itemsVersion = 0
+
+    /// 搜索索引：hash → 已小写化的 haystack。条目变化时增量维护，
+    /// 搜索时只做 contains，不再每次重建字符串。
+    private var searchIndex: [String: String] = [:]
+    /// 索引里记录的来源应用名：复制同一内容换了应用时要刷新那一条的索引
+    private var indexAppName: [String: String] = [:]
+
+    /// 派生结果的缓存键：查询词 + 分类 + 条目版本
+    private struct FilterKey: Equatable {
+        var query: String
+        var category: UUID?
+        var version: Int
+    }
+    private var cachedFilterKey: FilterKey?
+    private var cachedFiltered: [ClipItem] = []
+    private var cachedSectionsKey: FilterKey?
+    private var cachedSections: [DisplaySection] = []
+    private var cachedFlatKey: FilterKey?
+    private var cachedFlat: [ClipItem] = []
+    /// 分类角标计数：每次 refresh 算一次，而不是每个标签重绘都扫一遍全表
+    private var categoryCounts: [UUID: Int] = [:]
 
     var appVersion: String {
         Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0.0"
@@ -202,6 +230,10 @@ final class AppModel: ObservableObject {
             refresh()
         }
         if old.categories != new.categories {
+            // 分类规则变了 → 过滤/分区结果与角标计数都失效
+            itemsVersion &+= 1
+            invalidateFilterCache()
+            categoryCounts = [:]
             objectWillChange.send()
         }
     }
@@ -224,6 +256,10 @@ final class AppModel: ObservableObject {
     // ── 采集 ─────────────────────────────────────────────────
 
     private func handleCapture(_ item: ClipItem) {
+        // 装载完成之前不收：此时 store 还是空仓库，insert + save 会把磁盘上的
+        // 真实历史覆盖成一条。监听器本来就在装载后才启动（historyDidLoad），
+        // 这里是给"面板抢先呼出触发 pollNow"兜底。
+        guard historyLoaded else { return }
         let outcome = store.insert(item, maxItems: prefs.value.maxItems)
         store.save()
         refresh()
@@ -250,6 +286,9 @@ final class AppModel: ObservableObject {
     }
 
     var filteredItems: [ClipItem] {
+        let key = filterKey()
+        if key == cachedFilterKey { return cachedFiltered }
+
         let category = prefs.value.category(id: selectedCategoryID)
         let tokens = query
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -257,48 +296,65 @@ final class AppModel: ObservableObject {
             .split(separator: " ")
             .map(String.init)
 
-        return items.filter { item in
+        let result = items.filter { item in
             if let category {
                 let hit = ContentClassifier.categoryIDs(for: item, in: [category]).contains(category.id)
                 if !hit { return false }
             }
             guard !tokens.isEmpty else { return true }
             // 多个词是 AND：剪贴板搜索经常是"我记得里面有 A 和 B"
-            let haystack = (item.searchableText + "\n" + (item.sourceAppName ?? "") + "\n" + item.kind.title).lowercased()
+            // haystack 预先小写化并缓存（见 searchIndex）：每敲一个字符
+            // 都重新拼接 + lowercased 全部条目，是打字卡顿的真正来源。
+            let haystack = searchIndex[item.hash] ?? Self.haystack(item)
             return tokens.allSatisfy { haystack.contains($0) }
         }
+        cachedFilterKey = key
+        cachedFiltered = result
+        return result
     }
 
     /// 列表分区：只有**搜索**时才给不分区的平铺列表（用户要的是搜索结果）；
     /// 只选了分类（比如默认落在「收藏」）时保持"已置顶 + 按天归档"——
     /// 收藏是常驻视图，没有日期分组就没法定位"那条是哪天存的"。
     var sections: [DisplaySection] {
+        let key = filterKey()
+        if key == cachedSectionsKey { return cachedSections }
+
         let visible = filteredItems
         let hasSearch = !query.trimmingCharacters(in: .whitespaces).isEmpty
+        var result: [DisplaySection] = []
         if hasSearch {
-            return [DisplaySection(title: "", items: visible)]
+            result = [DisplaySection(title: "", items: visible)]
+        } else {
+            let pinned = visible.filter(\.pinned)
+            if !pinned.isEmpty {
+                result.append(DisplaySection(title: "已置顶", items: pinned))
+            }
+            let unpinned = visible.filter { !$0.pinned }
+            var buckets: [String: [ClipItem]] = [:]
+            var order: [String] = []
+            for item in unpinned {
+                let title = Support.dayTitle(item.createdAt)
+                if buckets[title] == nil { order.append(title) }
+                buckets[title, default: []].append(item)
+            }
+            for title in order {
+                result.append(DisplaySection(title: title, items: buckets[title] ?? []))
+            }
         }
-
-        var sections: [DisplaySection] = []
-        let pinned = visible.filter(\.pinned)
-        if !pinned.isEmpty {
-            sections.append(DisplaySection(title: "已置顶", items: pinned))
-        }
-        let unpinned = visible.filter { !$0.pinned }
-        var buckets: [String: [ClipItem]] = [:]
-        var order: [String] = []
-        for item in unpinned {
-            let title = Support.dayTitle(item.createdAt)
-            if buckets[title] == nil { order.append(title) }
-            buckets[title, default: []].append(item)
-        }
-        for title in order {
-            sections.append(DisplaySection(title: title, items: buckets[title] ?? []))
-        }
-        return sections
+        cachedSectionsKey = key
+        cachedSections = result
+        return result
     }
 
-    var flatVisibleItems: [ClipItem] { sections.flatMap(\.items) }
+    var flatVisibleItems: [ClipItem] {
+        let key = filterKey()
+        if key == cachedFlatKey { return cachedFlat }
+        let flat = sections.flatMap(\.items)
+        cachedFlatKey = key
+        cachedFlat = flat
+        return flat
+    }
 
     var selectedItem: ClipItem? {
         guard let selectedID else { return nil }
@@ -326,10 +382,93 @@ final class AppModel: ObservableObject {
     }
 
     func refresh() {
+        // 面板收着时只记脏：列表没人看，发布 items 只会让隐藏窗口里的
+        // SwiftUI 白算一遍（复制频繁时这条省的是实打实的后台 CPU）。
+        guard isPanelVisible else {
+            itemsDirty = true
+            return
+        }
+        applyItems()
+    }
+
+    /// 真正把仓库内容装进 @Published 并刷新派生缓存。
+    private func applyItems() {
         items = store.items
+        itemsVersion &+= 1
+        updateSearchIndex()
+        rebuildCategoryCounts()
+        invalidateFilterCache()
+        itemsDirty = false
         if selectedID == nil || !items.contains(where: { $0.id == selectedID }) {
             ensureValidSelection()
         }
+    }
+
+    /// 面板打开/收起时由 PanelController 通知。
+    func panelDidShow() {
+        isPanelVisible = true
+        // 慢速轮询期间复制的内容不能等到下一拍：立刻补扫一次。
+        // 但装载完成前不能扫（空仓库会被当成真历史落盘），等 historyDidLoad 补。
+        watcher.setActive(true)
+        if historyLoaded { watcher.pollNow() }
+        if itemsDirty || items.isEmpty {
+            applyItems()
+        } else {
+            ensureValidSelection()
+        }
+    }
+
+    func panelDidHide() {
+        isPanelVisible = false
+        watcher.setActive(false)
+    }
+
+    private func invalidateFilterCache() {
+        cachedFilterKey = nil
+        cachedSectionsKey = nil
+        cachedFlatKey = nil
+    }
+
+    private func filterKey() -> FilterKey {
+        FilterKey(query: query, category: selectedCategoryID, version: itemsVersion)
+    }
+
+    /// 参与搜索的正文（小写化）。文件条目把文件名也纳入，搜文件名能命中。
+    static func haystack(_ item: ClipItem) -> String {
+        (item.searchableText + "\n" + (item.sourceAppName ?? "") + "\n" + item.kind.title).lowercased()
+    }
+
+    private func updateSearchIndex() {
+        let hashes = Set(items.map(\.hash))
+        // 集合变了（新增/删除/上限淘汰）：整表重建，顺带清掉过期条目
+        if searchIndex.count != hashes.count || !hashes.isSubset(of: Set(searchIndex.keys)) {
+            var index: [String: String] = [:]
+            var apps: [String: String] = [:]
+            index.reserveCapacity(items.count)
+            apps.reserveCapacity(items.count)
+            for item in items {
+                index[item.hash] = Self.haystack(item)
+                apps[item.hash] = item.sourceAppName ?? ""
+            }
+            searchIndex = index
+            indexAppName = apps
+            return
+        }
+        // 集合没变：只补「来源应用换过」的那几条（同一内容在别的应用里又复制了一次）
+        for item in items where indexAppName[item.hash] != (item.sourceAppName ?? "") {
+            searchIndex[item.hash] = Self.haystack(item)
+            indexAppName[item.hash] = item.sourceAppName ?? ""
+        }
+    }
+
+    private func rebuildCategoryCounts() {
+        var counts: [UUID: Int] = [:]
+        for category in prefs.value.categories {
+            counts[category.id] = items.reduce(0) { partial, item in
+                partial + (ContentClassifier.categoryIDs(for: item, in: [category]).contains(category.id) ? 1 : 0)
+            }
+        }
+        categoryCounts = counts
     }
 
     // ── 选择移动 ─────────────────────────────────────────────
@@ -410,7 +549,9 @@ final class AppModel: ObservableObject {
         guard !multiSelection.isEmpty, let fav = defaultCategoryID else { return }
         var added = 0
         for id in multiSelection {
-            guard let item = items.first(where: { $0.id == id }) else { continue }
+            // 面板可能刚被收起（批量操作后），@Published 的 items 未必是最新的，
+            // 这里的正确性要认仓库本体
+            guard let item = store.items.first(where: { $0.id == id }) else { continue }
             var ids = item.manualCategoryIDs
             guard !ids.contains(fav) else { continue }
             ids.append(fav)
@@ -605,12 +746,14 @@ final class AppModel: ObservableObject {
     func clearHistory(keepPinned: Bool) {
         // 「收藏」里的条目是用户手动挑出来的心血，清空时永远保留——
         // 两个清空按钮都保留（用户指定）。置顶是否保留由 keepPinned 决定。
+        // 走 store.items：这个动作在设置页也能触发，那时面板可能收着，
+        // @Published 的 items 是旧快照，拿它算 keep 集合会漏。
         var keep = Set<UUID>()
         if keepPinned {
-            keep.formUnion(items.filter(\.pinned).map(\.id))
+            keep.formUnion(store.items.filter(\.pinned).map(\.id))
         }
         if let fav = defaultCategoryID {
-            for item in items where
+            for item in store.items where
                 ContentClassifier.categoryIDs(for: item, in: prefs.value.categories).contains(fav) {
                 keep.insert(item.id)
             }
@@ -638,7 +781,10 @@ final class AppModel: ObservableObject {
     }
 
     func categoryCount(_ category: Category) -> Int {
-        items.reduce(0) { partial, item in
+        // 角标计数在 applyItems 里一次算好；没算到的（刚新建的分类、
+        // 面板还没重开的场景）现算一次兜底。
+        if let cached = categoryCounts[category.id] { return cached }
+        return store.items.reduce(0) { partial, item in
             partial + (ContentClassifier.categoryIDs(for: item, in: [category]).contains(category.id) ? 1 : 0)
         }
     }
@@ -673,7 +819,7 @@ final class AppModel: ObservableObject {
         do {
             let data = try store.exportData(appVersion: appVersion)
             try data.write(to: url, options: .atomic)
-            statusMessage = "已导出 \(items.count) 项到 \(url.lastPathComponent)"
+            statusMessage = "已导出 \(store.items.count) 项到 \(url.lastPathComponent)"
         } catch {
             statusMessage = "导出失败：\(error.localizedDescription)"
         }
