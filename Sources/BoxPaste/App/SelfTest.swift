@@ -44,6 +44,7 @@ enum SelfTest {
         importExportTests()
         richTextTests()
         imageCaptureTests()
+        blobGCTests()
         previewTests()
         shortcutTests()
         preferenceTests()
@@ -393,6 +394,53 @@ enum SelfTest {
         if let thumbURL = store.thumbnailURL(for: item) {
             check(FileManager.default.fileExists(atPath: thumbURL.path), "图片条目：缩略图落盘")
         }
+    }
+
+    // ── 孤儿 blob 对账 ───────────────────────────────────────
+
+    // 删除路径只要漏一条，blob 就永久占着磁盘且没人记得名字。
+    // 这里验证对账只清"没人引用"的，被引用的原图**和派生缩略图**都不能动。
+    private static func blobGCTests() {
+        let root = temporaryRoot("blobgc")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = ClipStore(root: root)
+        let manager = FileManager.default
+
+        // 造一张真图走真实落盘路径（原图 + 缩略图都由它写出来）
+        guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 40, pixelsHigh: 20,
+                                         bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
+                                         isPlanar: false, colorSpaceName: .deviceRGB,
+                                         bytesPerRow: 0, bitsPerPixel: 0),
+              let png = rep.representation(using: .png, properties: [:]) else {
+            check(false, "对账测试：造图")
+            return
+        }
+        guard let imageItem = ClipboardWatcher.imageItem(png: png, store: store) else {
+            check(false, "对账测试：图片条目")
+            return
+        }
+        store.insert(imageItem, maxItems: 100)
+        let keptBlob = store.imageURL(for: imageItem)
+        let keptThumb = store.thumbnailURL(for: imageItem)
+
+        // 再造两个"没人引用"的文件：一个像原图、一个像缩略图
+        try? store.writeBlob(data: Data(repeating: 7, count: 1024), name: "orphan.png")
+        try? store.writeBlob(data: Data(repeating: 7, count: 512), name: "orphan@thumb.png")
+        // 富文本孤儿
+        try? store.writeBlob(data: Data("{rtf}".utf8), name: "orphan.rtf")
+
+        let swept = store.collectOrphanBlobs()
+        equal(swept.count, 3, "对账：清掉 3 个孤儿文件")
+        check(swept.bytes > 0, "对账：返回清理字节数")
+        equal(manager.fileExists(atPath: store.blobURL(named: "orphan.png").path), false,
+              "对账：孤儿原图被删")
+        equal(manager.fileExists(atPath: store.blobURL(named: "orphan.rtf").path), false,
+              "对账：孤儿富文本被删")
+        if let keptBlob { check(manager.fileExists(atPath: keptBlob.path), "对账：在用原图保留") }
+        if let keptThumb { check(manager.fileExists(atPath: keptThumb.path), "对账：在用缩略图保留") }
+
+        // 幂等：再跑一次什么都不该删
+        equal(store.collectOrphanBlobs().count, 0, "对账：第二次无孤儿可清")
     }
 
     // ── 预览截断 ─────────────────────────────────────────────

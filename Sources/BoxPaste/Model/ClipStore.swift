@@ -216,6 +216,48 @@ final class ClipStore {
         }
     }
 
+    /// 对账 blobs 目录：删掉没有任何条目引用的文件，返回（个数, 字节）。
+    ///
+    /// 为什么需要这一手：删除路径再怎么写也总有漏网的时候 —— 老版本漏删、
+    /// 导入/恢复覆盖了历史、进程恰好在「写完 blob、还没存 history」之间被杀。
+    /// 这些文件没人记得名字，只能靠「当前所有条目真正引用的名字」反推。
+    ///
+    /// 安全前提：**条目为空时不要调**。历史文件损坏被读成空数组时，
+    /// 这里会把所有 blob 当孤儿删光——宁可留垃圾，也不能删用户数据。
+    @discardableResult
+    func collectOrphanBlobs() -> (count: Int, bytes: Int) {
+        let manager = FileManager.default
+        guard let entries = try? manager.contentsOfDirectory(at: blobsDirectory,
+                                                             includingPropertiesForKeys: [.fileSizeKey]) else {
+            return (0, 0)
+        }
+        // 缩略图名由原图名派生（见 thumbnailURL），所以引用集要一起算进去
+        var referenced = Set<String>()
+        for item in items {
+            if let name = item.blobName {
+                referenced.insert(name)
+                if item.kind == .image {
+                    let base = (name as NSString).deletingPathExtension
+                    let ext = (name as NSString).pathExtension
+                    referenced.insert("\(base)@thumb.\(ext.isEmpty ? "png" : ext)")
+                }
+            }
+            if let name = item.rtfBlobName { referenced.insert(name) }
+            if let name = item.htmlBlobName { referenced.insert(name) }
+        }
+        var count = 0
+        var bytes = 0
+        for url in entries {
+            guard !referenced.contains(url.lastPathComponent) else { continue }
+            let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+            guard (try? manager.removeItem(at: url)) != nil else { continue }
+            ThumbnailCache.shared.forget(url)
+            count += 1
+            bytes += size
+        }
+        return (count, bytes)
+    }
+
     func totalBlobBytes() -> Int {
         guard let entries = try? FileManager.default.contentsOfDirectory(at: blobsDirectory,
                                                                         includingPropertiesForKeys: [.fileSizeKey]) else {

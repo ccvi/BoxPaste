@@ -166,6 +166,15 @@ final class AppModel: ObservableObject {
         }
         historyLoaded = true
         store.enforceLimit(prefs.value.maxItems)
+
+        // 启动时对账一次磁盘：老版本漏删 / 进程被杀在半路留下的孤儿 blob，
+        // 没有任何条目引用它们，只能这样反推出来。条目为空时不做（见函数注释）。
+        if !store.items.isEmpty {
+            let swept = store.collectOrphanBlobs()
+            if swept.count > 0 {
+                DiagLog.append("启动对账：清理孤儿 blob \(swept.count) 个 · \(Support.humanByteCount(swept.bytes))")
+            }
+        }
         refresh()
 
         watcher.captureRichText = prefs.value.captureRichText
@@ -760,6 +769,11 @@ final class AppModel: ObservableObject {
         }
         store.clearAll(keeping: keep)
         store.save()
+        // 清空是一次性大动作：顺手把磁盘上没人引用的 blob 对账掉
+        let swept = store.collectOrphanBlobs()
+        if swept.count > 0 {
+            DiagLog.append("清空后清理孤儿 blob：\(swept.count) 个 · \(Support.humanByteCount(swept.bytes))")
+        }
         refresh()
         ensureValidSelection()
         showHint(keepPinned ? "已清空（置顶与收藏保留）" : "已清空（收藏保留）")

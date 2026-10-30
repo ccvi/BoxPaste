@@ -158,6 +158,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func previewDiagStep() {
         guard let item = previewDiagQueue.first else {
             recordFootprint("全部预览结束（预览均已关闭）")
+            // 顺手记一笔：malloc_zone_pressure_relief 在这代系统上是不是真的能还页。
+            // macOS 26 实测恒返回 0（xzone 分配器不让空闲页还给内核），留着当哨兵，
+            // 哪天系统改了行为这里会立刻看见。
+            let released = malloc_zone_pressure_relief(nil, 0)
+            previewDiagLines.append(String(format: "relief 探针：malloc 报告归还 %.2f MB → %.1f MB",
+                                           Double(released) / 1_000_000, Support.physFootprintMB))
+            flushPreviewDiag()
             exit(0)
         }
         previewDiagQueue.removeFirst()
