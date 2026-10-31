@@ -2,16 +2,17 @@ import AppKit
 import SwiftUI
 
 // ============================================================
-// 空格预览
+// 空格预览（独立窗口里的那层卡片）
 //
-// 覆盖在面板之上的一层，按内容类型给最合适的"看"法：
+// 按内容类型给最合适的"看"法：
 //   图像 → 大图；文本 → 全文可选中；链接 → 域名 + 完整地址；
 //   颜色 → 大色块 + HEX/RGB/HSL 三种写法（都能一键复制）；
 //   文件 → 逐个文件的大小与路径。
-// 关闭方式：再按空格 / Esc / 点空白处。
+// 窗口本身由 PreviewWindowController 管（800×500、屏幕居中、置顶）；
+// 关闭方式：再按空格 / Esc / 右上角 ×。
 // ============================================================
 
-struct PreviewOverlayView: View {
+struct PreviewCard: View {
     @EnvironmentObject var model: AppModel
     let item: ClipItem
 
@@ -26,30 +27,27 @@ struct PreviewOverlayView: View {
     @State private var richPreview: NSAttributedString?
 
     var body: some View {
-        ZStack {
-            Rectangle()
-                .fill(.ultraThinMaterial)
-                .onTapGesture { model.isPreviewing = false }
-
-            VStack(alignment: .leading, spacing: 0) {
-                header
-                Divider().opacity(0.5)
-                ScrollView {
-                    content
-                        .padding(14)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                Divider().opacity(0.5)
-                footer
+        VStack(alignment: .leading, spacing: 0) {
+            header
+            Divider().opacity(0.5)
+            ScrollView {
+                content
+                    .padding(14)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-            .overlay {
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .strokeBorder(Color.primary.opacity(0.10), lineWidth: 1)
-            }
-            .padding(14)
+            Divider().opacity(0.5)
+            footer
         }
-        .transition(.opacity)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        // 窗口是透明无边框的，圆角与背景全靠这层卡片自己画。
+        // 底色必须是**不透明**的：预览窗居中后会正好压在面板上，用毛玻璃的话
+        // 面板的选中色、行文字会透过来看得一清二楚（实测过，像没擦干净的玻璃）。
+        .background(Color(nsColor: .windowBackgroundColor))
+        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.10), lineWidth: 1)
+        }
     }
 
     // ── 头部 ─────────────────────────────────────────────────

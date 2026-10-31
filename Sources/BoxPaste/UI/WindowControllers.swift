@@ -381,6 +381,8 @@ final class PanelController: NSObject, NSWindowDelegate {
 
     private let model: AppModel
     private let window: PanelWindow
+    /// 空格预览是独立窗口（800×500 屏幕居中），见 PreviewWindow.swift
+    private let preview: PreviewWindowController
     private var keyMonitor: Any?
     /// 呼出面板之前最前面的那个"别人的"应用，粘贴时要还给它
     // 必须强引用：NSRunningApplication 实例跟进程不是绑死的，没强引用时
@@ -400,6 +402,7 @@ final class PanelController: NSObject, NSWindowDelegate {
                                   styleMask: [.borderless, .nonactivatingPanel, .resizable],
                                   backing: .buffered,
                                   defer: false)
+        self.preview = PreviewWindowController(model: model)
         super.init()
 
         window.delegate = self
@@ -418,6 +421,13 @@ final class PanelController: NSObject, NSWindowDelegate {
         let hosting = NSHostingView(rootView: PanelRootView().environmentObject(model))
         hosting.autoresizingMask = [.width, .height]
         window.contentView = hosting
+
+        // 预览显隐只有模型知道（空格 / Esc / × / 删除条目都会改它），
+        // 窗口控制器被动跟随，避免两处各自维护一个"开着吗"的布尔值。
+        model.onPreviewVisibilityChanged = { [weak self] visible in
+            guard let self else { return }
+            if visible { self.preview.show() } else { self.hidePreview() }
+        }
     }
 
     var isVisible: Bool { window.isVisible }
@@ -454,6 +464,7 @@ final class PanelController: NSObject, NSWindowDelegate {
 
     func hide() {
         removeMonitor()
+        hidePreview()
         window.orderOut(nil)
         model.isPreviewing = false
         model.showsShortcutHelp = false
@@ -466,6 +477,17 @@ final class PanelController: NSObject, NSWindowDelegate {
         // 收起后列表不再刷新（refresh 只记脏）、轮询放慢，见 AppModel.panelDidHide
         model.panelDidHide()
         rememberGeometry()
+    }
+
+    /// 收起预览窗。用户点进预览窗选过文字的话它会是 key window，
+    /// 这时必须把键盘还给面板，否则之后按空格/Esc 都落在一个隐藏窗口上，
+    /// 表现就是"面板还在、按键没反应"。
+    private func hidePreview() {
+        let wasKey = preview.isKeyWindow
+        preview.hide()
+        if wasKey, window.isVisible {
+            window.makeKey()
+        }
     }
 
     /// 记下尺寸和位置：下次呼出还是这个样子、这个位置。
@@ -567,8 +589,10 @@ final class PanelController: NSObject, NSWindowDelegate {
 
     private func handle(_ event: NSEvent) -> NSEvent? {
         // 本地监听是应用级的：设置窗口、保存面板的按键也会经过这里，
-        // 只处理属于本面板的那些。
-        guard event.window === window else { return event }
+        // 只处理属于本面板（和它的预览窗）的那些。
+        // 预览窗也要收：用户点进去选文字后它就是 key window，
+        // 这时空格/Esc/方向键必须照常生效，否则"一点文字就失去键盘控制"。
+        guard event.window === window || event.window === preview.nsWindow else { return event }
         let prefs = model.prefs.value
 
         // 1) 搜索框聚焦时，先把键让给输入框。

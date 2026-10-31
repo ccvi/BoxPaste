@@ -26,7 +26,12 @@ final class AppModel: ObservableObject {
     @Published var selectedID: UUID? {
         didSet { if selectedID != oldValue { isPreviewing = false } }
     }
-    @Published var isPreviewing = false
+    @Published var isPreviewing = false {
+        // 预览是独立窗口（800×500 居中），显隐由 PanelController 接这个回调去开合。
+        // 放在 didSet 里而不是让视图监听，是为了保证"任何路径改的 isPreviewing
+        // 都同步到窗口"——空格、Esc、×、删除条目，路径有好几条。
+        didSet { if oldValue != isPreviewing { onPreviewVisibilityChanged?(isPreviewing) } }
+    }
     @Published var searchFocused = false
     @Published var showsShortcutHelp = false
     /// 面板顶部的一行提示（授权提醒、删除撤销等），几秒后自动消失
@@ -57,6 +62,8 @@ final class AppModel: ObservableObject {
     var onCopyFeedback: (() -> Void)?
     /// 状态栏图标状态变化（暂停/恢复记录）后重绘
     var onIconStateChanged: (() -> Void)?
+    /// 预览开关（true = 开）。由 PanelController 接管独立预览窗的显隐。
+    var onPreviewVisibilityChanged: ((Bool) -> Void)?
     /// 粘贴前把焦点还给"上一个外部应用"
     var onReactivatePreviousApp: (() -> Void)?
     /// 粘贴目标（上一个外部应用）。AppDelegate 把 panel.pasteTarget 接过来，

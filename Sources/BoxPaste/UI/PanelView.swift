@@ -45,11 +45,6 @@ struct PanelRootView: View {
                 .strokeBorder(Color.primary.opacity(0.10), lineWidth: 1)
         }
         .overlay {
-            if model.isPreviewing, let item = model.selectedItem {
-                PreviewOverlayView(item: item)
-            }
-        }
-        .overlay {
             if model.showsShortcutHelp {
                 ShortcutHelpOverlay()
             }

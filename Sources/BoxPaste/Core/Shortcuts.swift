@@ -122,7 +122,7 @@ enum ShortcutAction: String, Codable, CaseIterable, Identifiable {
         case .recallPanel:  return "全局生效，任何应用里都能按"
         case .openSettings: return "全局生效"
         case .paste:        return "面板内：写回剪贴板并按需自动粘贴"
-        case .preview:      return "面板内：空格键预览，可看 HEX 色块与全文"
+        case .preview:      return "独立窗口预览（800×500 居中）：看全文、大图、HEX 色块"
         case .pin:          return "面板内：置顶的条目不会被条数上限淘汰"
         case .delete:       return "面板内"
         case .copy:         return "面板内：只回写剪贴板，面板不关闭"
