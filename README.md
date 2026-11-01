@@ -90,7 +90,13 @@ Tools/                  make-icon-source.swift、make-icon.swift（被 build-app
 
 1. 🔴 **永远不要直接执行 `.app` 里的二进制**。绕过 LaunchServices 会让这个 bundle id 的**状态栏登记永久失效**，只能换 bundle id 才能救。自检因此只跑 `.build` 里的裸产物
 2. 🔴 **bundle id 不能随便改回去**（`AppIdentity.swift`），改一次状态项登记就废一次
-3. 🔴 **ad-hoc 签名下不要附加任何受限授权**（`com.apple.developer.*`），会让 launchd spawn 失败（POSIX 163）
+3. 🔴 **签名用固定本地证书，安装时绝不重新签名**。「辅助功能」授权是 TCC 按签名要求记的：
+   ad-hoc（`--sign -`）的 cdhash 每次构建都变，等于每装一次新版本授权就掉一次；
+   打包默认自动挑 `FastFind Local Signing`，签名要求因此变成
+   `identifier "com.pcxx.boxpastemac" and certificate root = H"…"`，跨版本稳定。
+   安装段必须是 `ditto` + `xattr -cr` + cdhash 比对，**不能跟一句 `codesign --force --sign -`**
+   ——那句会把证书覆盖回 ad-hoc，症状是"装完看着一切正常，自动粘贴一条都不触发"。
+   另：固定证书下仍然不要附加受限授权（`com.apple.developer.*`），会让 launchd spawn 失败（POSIX 163）
 4. **热键注册 API 的"先注册后清理"形状是刻意的**：早先的写法在 `register()` 内部先 `unregisterAll()`，于是注册第二个热键时把第一个一起清了，表现是**呼出热键静默失效**
 5. **热键回调闭包不能捕获上下文**：它被当成 C 函数指针传下去
 6. **`LSUIElement` 应用的最小主菜单不能删**：没有系统菜单栏，文本框就按不出 ⌘C / ⌘V / ⌘A

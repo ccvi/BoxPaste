@@ -6,14 +6,22 @@
 # 产出 dist/BoxPaste.app —— 可双击、可拖进 /Applications 的原生应用。
 #
 # 用法：
-#   ./build-app.sh                发布构建（release，带图标，ad-hoc 签名）
+#   ./build-app.sh                发布构建（release，带图标，自动挑签名身份）
 #   ./build-app.sh --debug        调试构建
 #   ./build-app.sh --no-sign      跳过签名
 #   ./build-app.sh --no-sandbox   让 swift build 跳过 SwiftPM 自带的沙箱
 #   ./build-app.sh --install      构建完装到 /Applications
+#   ./build-app.sh --identity X   指定签名身份（默认自动挑本地固定证书）
 #   ./build-app.sh --bump         强制版本号 +1（即使源码没变）
 #   ./build-app.sh --no-bump      保持版本号不变（指纹照常更新）
 #   ./build-app.sh --clean        先清掉 .build 再构建
+#
+# 关于签名（这条踩过真坑，别改回去）：
+#   「辅助功能」授权是 TCC 按**签名要求**记的。ad-hoc 签名（--sign -）每次产物的
+#   cdhash 都变，等于每打一次包授权就掉一次；换成固定本地证书后，签名要求变成
+#   `identifier "com.pcxx.boxpastemac" and certificate leaf = H"…"`，跨版本稳定，
+#   升级后不用重新勾授权。本机可用身份：security find-identity -v -p codesigning。
+#   安装到 /Applications 也必须**用 ditto 复制、不重新签名**（见文件末尾 --install 段）。
 #
 # 关于 --no-sandbox：正常终端里不需要它。只有当这个脚本本身运行在另一个沙箱内部时
 # （受限 CI、容器、某些编辑器内置终端），SwiftPM 会让 sandbox-exec 再套一层沙箱，
@@ -39,6 +47,8 @@ FORCE_BUMP=0
 SKIP_BUMP=0
 DO_CLEAN=0
 SWIFT_FLAGS=()
+# 空字符串 = 还没定，下面按本机有没有固定证书自动挑
+SIGN_IDENTITY=""
 
 for argument in "$@"; do
     case "$argument" in
@@ -49,16 +59,43 @@ for argument in "$@"; do
         --bump)       FORCE_BUMP=1 ;;
         --no-bump)    SKIP_BUMP=1 ;;
         --clean)      DO_CLEAN=1 ;;
+        --identity)
+            # 值放在下一个位置参数里：这里用 while 取会打乱 for 的遍历，
+            # 所以改成"记下等待下一个参数"的写法
+            NEED_IDENTITY_VALUE=1
+            ;;
         -h|--help)
-            sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
+            sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'
             exit 0
             ;;
         *)
-            echo "未知参数：${argument}（用 --help 查看用法）" >&2
-            exit 1
+            if [[ "${NEED_IDENTITY_VALUE:-0}" == "1" ]]; then
+                SIGN_IDENTITY="$argument"
+                NEED_IDENTITY_VALUE=0
+            else
+                echo "未知参数：${argument}（用 --help 查看用法）" >&2
+                exit 1
+            fi
             ;;
     esac
 done
+
+if [[ "${NEED_IDENTITY_VALUE:-0}" == "1" ]]; then
+    echo "--identity 需要一个身份名称（security find-identity -v -p codesigning）" >&2
+    exit 1
+fi
+
+# 没指定就用本机的固定证书：ad-hoc 会让 TCC 授权每次更新都掉（见文件头的说明）
+if [[ -z "$SIGN_IDENTITY" ]]; then
+    # 不用 grep：这个脚本有时候会在 PATH 被改过的环境里跑
+    if security find-identity -v -p codesigning 2>/dev/null | awk '/FastFind Local Signing/ {found=1} END {exit !found}'; then
+        SIGN_IDENTITY="FastFind Local Signing"
+    else
+        SIGN_IDENTITY="-"
+        echo "⚠ 本机没有固定签名证书，退回 ad-hoc —— 本次安装后「辅助功能」授权会失效" >&2
+        echo "  先建一张本地证书再用：钥匙串访问 → 证书助理 → 创建证书（代码签名）" >&2
+    fi
+fi
 
 APP_NAME="BoxPaste"
 DISPLAY_NAME="BoxPaste"
@@ -274,11 +311,17 @@ xattr -cr "$APP_DIR" 2>/dev/null || true
 # 5. 签名
 # ------------------------------------------------------------
 if [[ "$DO_SIGN" == "1" ]]; then
-    echo "▶ 代码签名（ad-hoc）…"
-    # ⚠️ ad-hoc 签名下不要附加任何受限授权（com.apple.developer.*）：
-    # 家族里实测过 AMFI 会直接拒绝，launchd spawn failed（POSIX 163），
-    # 应用打不开——比少个功能严重得多。
-    codesign --force --sign - --timestamp=none "$APP_DIR" 2>&1 | sed 's/^/  /' || {
+    if [[ "$SIGN_IDENTITY" == "-" ]]; then
+        echo "▶ 代码签名（ad-hoc）…"
+    else
+        # 变量后面紧跟全角括号时必须用 ${} 包起来：
+        # 不加花括号 bash 会把「）」的首字节并进变量名，报 SIGN_IDENTITY<乱码>: unbound variable
+        echo "▶ 代码签名（${SIGN_IDENTITY}）…"
+    fi
+    # ⚠️ 不要附加任何受限授权（com.apple.developer.*）：家族里实测过 AMFI 会直接拒绝，
+    # launchd spawn failed（POSIX 163），应用打不开——比少个功能严重得多。
+    # --deep 不在这里用：整包只有一个可执行文件，--deep 反而会重签内部并改变 cdhash。
+    codesign --force --sign "$SIGN_IDENTITY" --timestamp=none "$APP_DIR" 2>&1 | sed 's/^/  /' || {
         echo "  ⚠ 签名失败，应用仍可运行，但权限记忆可能不稳定" >&2
     }
     if codesign --verify --deep --strict "$APP_DIR" 2>/dev/null; then
@@ -286,6 +329,8 @@ if [[ "$DO_SIGN" == "1" ]]; then
     else
         echo "  ⚠ 签名校验未通过（改用 --no-sign 可跳过这一步）" >&2
     fi
+    # 把签名要求打出来：TCC 授权就是按这一行记的，将来"授权又掉了"先看它有没有变
+    codesign -d -r- "$APP_DIR" 2>&1 | awk 'NR<=2' | sed 's/^/  /'
 else
     echo "▶ 已跳过签名（--no-sign）"
 fi
@@ -312,10 +357,31 @@ if [[ "$DO_INSTALL" == "1" ]]; then
     echo ""
     echo "▶ 安装到 /Applications…"
     rm -rf "/Applications/$APP_NAME.app"
-    cp -R "$APP_DIR" "/Applications/"
+    # 🔴 用 ditto 复制，**绝不重新签名**。
+    # 这里曾经是「cp -R + codesign --force --sign -」：那句重签会把打包时的
+    # 固定证书覆盖成临时签名，cdhash 一变，macOS 的「辅助功能」授权立刻作废——
+    # 症状就是"装完看着一切正常，自动粘贴一条都不触发"。
+    # ditto 保留签名封存；xattr 不在封存范围里，清一下隔离属性是安全的。
+    ditto "$APP_DIR" "/Applications/$APP_NAME.app"
     xattr -cr "/Applications/$APP_NAME.app" 2>/dev/null || true
-    codesign --force --sign - --timestamp=none "/Applications/$APP_NAME.app" > /dev/null 2>&1 || true
-    echo "  ✓ 已安装：/Applications/$APP_NAME.app"
+
+    if ! codesign --verify --deep --strict "/Applications/$APP_NAME.app" 2>/dev/null; then
+        echo "  ✗ 安装副本的签名校验没过，TCC 授权会掉——检查 $SIGN_IDENTITY" >&2
+        exit 1
+    fi
+    # cdhash 必须和 dist 里的一致，否则说明复制/签名被改写过
+    # （codesign -dvvv 输出是 `CDHash=xxxx`，没有空格，必须按 = 切）
+    DIST_HASH=$(codesign -dvvv "$APP_DIR" 2>&1 | awk -F= '/^CDHash=/ {print $2; exit}')
+    INSTALL_HASH=$(codesign -dvvv "/Applications/$APP_NAME.app" 2>&1 | awk -F= '/^CDHash=/ {print $2; exit}')
+    if [[ -z "$INSTALL_HASH" ]]; then
+        echo "  ✗ 读不到安装副本的 cdhash，无法确认签名没被改动" >&2
+        exit 1
+    fi
+    if [[ "$DIST_HASH" != "$INSTALL_HASH" ]]; then
+        echo "  ✗ 安装副本 cdhash 与构建产物不一致（${DIST_HASH:0:12} ≠ ${INSTALL_HASH:0:12}）" >&2
+        exit 1
+    fi
+    echo "  ✓ 已安装：/Applications/$APP_NAME.app（cdhash ${INSTALL_HASH:0:12}…，签名未被改动）"
 fi
 
 cat <<'TIPS'
