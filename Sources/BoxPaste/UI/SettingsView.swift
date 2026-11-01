@@ -223,10 +223,6 @@ struct GeneralSettings: View {
 
     var body: some View {
         SettingsCard(title: "启动与窗口") {
-            SettingsRow(label: "开机自动启动", detail: "登录后静默启动，不抢焦点") {
-                SettingsSwitch(isOn: prefs.binding(\.launchAtLogin))
-            }
-            RowDivider()
             SettingsRow(label: "在 Dock 中隐藏图标",
                         detail: "初始安装时 Dock 会显示图标；打开后从 Dock 移除，只驻留菜单栏") {
                 SettingsSwitch(isOn: prefs.binding(\.hideDockIcon))
