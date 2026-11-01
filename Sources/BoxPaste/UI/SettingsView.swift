@@ -311,6 +311,19 @@ struct GeneralSettings: View {
                 }
             }
             RowDivider()
+            SettingsRow(label: "最长保存时间",
+                        detail: "到期自动清除更早的记录；「收藏」里的条目始终保留") {
+                Picker("", selection: prefs.binding(\.maxAgeDays)) {
+                    ForEach(Preferences.maxAgeOptions, id: \.self) { days in
+                        Text(Preferences.maxAgeTitle(days)).tag(days)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .controlSize(.regular)
+                .frame(width: 140)
+            }
+            RowDivider()
             SettingsRow(label: "监听间隔", detail: "越短越及时，但读剪贴板的次数也越多；0.35 秒是常用值") {
                 HStack(spacing: 8) {
                     Slider(value: prefs.binding(\.pollInterval), in: 0.15...1.0, step: 0.05)

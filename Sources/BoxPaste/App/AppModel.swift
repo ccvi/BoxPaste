@@ -72,6 +72,9 @@ final class AppModel: ObservableObject {
 
     private var hintTask: DispatchWorkItem?
     private var undoStack: [[ClipItem]] = []
+    /// 保留期清扫定时器（30 分钟一次）。常驻应用可能几周不重启，
+    /// 只在启动时清的话用户永远看不到"到期就消失"。
+    private var expiryTimer: Timer?
     private var accessibilityObserver: NSObjectProtocol?
     /// 历史是否已从磁盘装载完成。没装载完之前**不许** save()——
     /// 否则空仓库会把磁盘上的真实历史整个覆盖掉。
@@ -152,6 +155,14 @@ final class AppModel: ObservableObject {
         }
         RunLoop.main.add(poll, forMode: .common)
 
+        // 保留期清扫：到期是「天」级的事，30 分钟一次足够；
+        // 间隔短了只是白扫一遍 items，间隔长了用户会觉得"到期了怎么还在"。
+        let expiry = Timer(timeInterval: 1800, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.purgeExpired(announce: false) }
+        }
+        RunLoop.main.add(expiry, forMode: .common)
+        expiryTimer = expiry
+
         // ② 历史装载放后台：条数多时解码有几十毫秒级开销，不该挡在启动路径上。
         //    读盘是纯函数（ClipStore.readItems），后台跑完回主线程赋值。
         // ③ 监听器等装载完成再启动：启动时"补收当前剪贴板"要落在真实历史上，
@@ -183,6 +194,8 @@ final class AppModel: ObservableObject {
             }
         }
         refresh()
+        // 启动时按保留期清一次：应用可能几周没重启，光等定时器会漏
+        purgeExpired(announce: false)
 
         watcher.captureRichText = prefs.value.captureRichText
         watcher.paused = isPaused
@@ -206,6 +219,8 @@ final class AppModel: ObservableObject {
         if let accessibilityObserver {
             DistributedNotificationCenter.default.removeObserver(accessibilityObserver)
         }
+        expiryTimer?.invalidate()
+        expiryTimer = nil
         watcher.stop()
         // 历史还没装载完就退出（启动即杀）时绝不能 save：
         // 空仓库写下去等于把磁盘上的真实历史清空。
@@ -244,6 +259,10 @@ final class AppModel: ObservableObject {
             store.enforceLimit(new.maxItems)
             store.save()
             refresh()
+        }
+        if old.maxAgeDays != new.maxAgeDays {
+            // 用户刚把保留期改短：立刻清一次，别等他下次启动才看到效果
+            purgeExpired(announce: true)
         }
         if old.categories != new.categories {
             // 分类规则变了 → 过滤/分区结果与角标计数都失效
@@ -432,6 +451,8 @@ final class AppModel: ObservableObject {
         } else {
             ensureValidSelection()
         }
+        // 用户可能是隔了几天才重新打开面板：这时候比定时器更需要立刻清一次
+        purgeExpired(announce: false)
     }
 
     func panelDidHide() {
@@ -759,20 +780,43 @@ final class AppModel: ObservableObject {
         showHint("已恢复 \(last.count) 项")
     }
 
+    /// 「收藏」里的条目 id。清空历史与过期清理都豁免它们——
+    /// 用户手动挑出来的东西，不该被任何自动清扫带走。
+    func favoriteItemIDs() -> Set<UUID> {
+        guard let fav = defaultCategoryID else { return [] }
+        var ids = Set<UUID>()
+        for item in store.items where
+            ContentClassifier.categoryIDs(for: item, in: prefs.value.categories).contains(fav) {
+            ids.insert(item.id)
+        }
+        return ids
+    }
+
+    /// 清掉超过「最长保存时间」的条目（收藏豁免）。
+    /// announce=true 时给一条提示，用于用户刚改完设置的那一刻。
+    func purgeExpired(announce: Bool) {
+        guard historyLoaded else { return }
+        let days = prefs.value.maxAgeDays
+        guard days > 0 else { return }
+        let removed = store.purgeExpired(maxAgeDays: days, keeping: favoriteItemIDs())
+        guard !removed.isEmpty else { return }
+        store.save()
+        refresh()
+        ensureValidSelection()
+        DiagLog.append("过期清理：删除 \(removed.count) 条（保留 \(days) 天，收藏豁免）")
+        if announce {
+            showHint("已清除 \(removed.count) 条超过 \(days) 天的记录（收藏已保留）")
+        }
+    }
+
     func clearHistory(keepPinned: Bool) {
         // 「收藏」里的条目是用户手动挑出来的心血，清空时永远保留——
         // 两个清空按钮都保留（用户指定）。置顶是否保留由 keepPinned 决定。
         // 走 store.items：这个动作在设置页也能触发，那时面板可能收着，
         // @Published 的 items 是旧快照，拿它算 keep 集合会漏。
-        var keep = Set<UUID>()
+        var keep = favoriteItemIDs()
         if keepPinned {
             keep.formUnion(store.items.filter(\.pinned).map(\.id))
-        }
-        if let fav = defaultCategoryID {
-            for item in store.items where
-                ContentClassifier.categoryIDs(for: item, in: prefs.value.categories).contains(fav) {
-                keep.insert(item.id)
-            }
         }
         store.clearAll(keeping: keep)
         store.save()

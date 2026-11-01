@@ -183,6 +183,20 @@ final class ClipStore {
         remove(ids: doomed.map(\.id))
     }
 
+    /// 超出保留期就删掉（keep 里的 id 豁免，调用方传「收藏」）。
+    ///
+    /// 为什么不按「天数差」算日期边界：用户要的是"30 天前的东西没了"，
+    /// 用 30×86400 秒的滚动窗口最直观，也不受时区/夏令时影响。
+    /// 置顶**不豁免**：这一项是按时间清扫，唯一例外是用户手动收藏的条目。
+    @discardableResult
+    func purgeExpired(maxAgeDays: Int, keeping keep: Set<UUID>, now: Date = Date()) -> [ClipItem] {
+        guard maxAgeDays > 0 else { return [] }
+        let cutoff = now.addingTimeInterval(-Double(maxAgeDays) * 86_400)
+        let doomed = items.filter { !keep.contains($0.id) && $0.createdAt < cutoff }
+        guard !doomed.isEmpty else { return [] }
+        return remove(ids: doomed.map(\.id))
+    }
+
     /// 把先前删掉的条目塞回来（撤销删除）。blob 文件也一起捡回来。
     func restore(_ restored: [ClipItem]) {
         for item in restored where !items.contains(where: { $0.hash == item.hash }) {

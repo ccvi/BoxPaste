@@ -40,6 +40,7 @@ enum SelfTest {
         colorTests()
         linkTests()
         storeTests()
+        expiryTests()
         ruleTests()
         importExportTests()
         richTextTests()
@@ -517,6 +518,7 @@ enum SelfTest {
             // 而不是把整份设置判为损坏（那会让升级=设置全丢）。
             equal(decoded.alwaysOnTop, false, "缺失的置顶开关落回 false")
             equal(decoded.captureRichText, true, "缺失的富文本开关落回 true")
+            equal(decoded.maxAgeDays, 0, "缺失的保留期限落回「不限」")
         } else {
             check(false, "旧配置可解码", detail: "字段缺失导致整份解码失败")
         }
@@ -602,6 +604,21 @@ enum SelfTest {
             equal(decoded.feedbackSound, Preferences().feedbackSound, "下线音效落回默认音色")
         } else {
             check(false, "含下线音效的配置可解码")
+        }
+
+        // 保留期限：选项清单内的值原样保留，清单外的（手改配置）落回「不限」
+        for days in Preferences.maxAgeOptions {
+            let data = Data("{\"maxAgeDays\": \(days)}".utf8)
+            if let decoded = try? JSONDecoder().decode(Preferences.self, from: data) {
+                equal(decoded.maxAgeDays, days, "保留期限 \(days) 天原样保留")
+            } else {
+                check(false, "保留期限 \(days) 天可解码")
+            }
+        }
+        if let decoded = try? JSONDecoder().decode(Preferences.self, from: Data("{\"maxAgeDays\": 37}".utf8)) {
+            equal(decoded.maxAgeDays, 0, "清单外的保留期限落回不限")
+        } else {
+            check(false, "清单外保留期限可解码")
         }
         check(SoundFeedback.availableNames.contains(Preferences().feedbackSound),
               "默认音色在当前音效清单里")
@@ -694,6 +711,49 @@ enum SelfTest {
     }
 
     // ── 工具 ─────────────────────────────────────────────────
+
+    // ── 保留期限 ─────────────────────────────────────────────
+
+    // 到期清理的判定完全是"createdAt 早于 cutoff"，这里把边界钉死：
+    // 刚好卡在期限上的那条不能删（否则用户会看到"设 30 天，第 30 天就没了"）。
+    private static func expiryTests() {
+        let root = temporaryRoot("expiry")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = ClipStore(root: root)
+        let now = Date()
+
+        func makeItem(_ text: String, daysAgo: Double) -> ClipItem {
+            var item = ClipboardWatcher.textItem(text)
+            item.createdAt = now.addingTimeInterval(-daysAgo * 86_400)
+            return item
+        }
+
+        let expired = makeItem("40 天前", daysAgo: 40)
+        let fresh = makeItem("20 天前", daysAgo: 20)
+        let edge = makeItem("刚好 30 天", daysAgo: 30)
+        let expiredFavorite = makeItem("40 天前但收藏了", daysAgo: 40)
+        for item in [expired, fresh, edge, expiredFavorite] {
+            store.insert(item, maxItems: 100)
+        }
+
+        let removed = store.purgeExpired(maxAgeDays: 30, keeping: [expiredFavorite.id], now: now)
+        equal(removed.count, 1, "到期清理只删超期的非收藏条目")
+        equal(store.items.count, 3, "清理后条数正确")
+        check(store.items.contains { $0.hash == fresh.hash }, "未到期条目保留")
+        check(store.items.contains { $0.hash == edge.hash }, "刚好卡在期限上不算过期")
+        check(store.items.contains { $0.hash == expiredFavorite.hash }, "收藏条目到期也保留")
+
+        // 不限（0）时一次都不能删
+        equal(store.purgeExpired(maxAgeDays: 0, keeping: [], now: now).count, 0, "不限时不清任何条目")
+        equal(store.items.count, 3, "不限时条数不变")
+
+        // 60/90 天：剩下的都在期限内
+        equal(store.purgeExpired(maxAgeDays: 90, keeping: [], now: now).count, 0, "90 天内无过期条目")
+        equal(store.purgeExpired(maxAgeDays: 45, keeping: [], now: now).count, 0, "45 天内无过期条目")
+        // 豁免是调用方传进来的，不是内建规则：不传 keep 时那条收藏也会过期
+        equal(store.purgeExpired(maxAgeDays: 30, keeping: [], now: now).count, 1, "不传豁免时收藏条目也过期")
+        equal(store.purgeExpired(maxAgeDays: 30, keeping: [], now: now).count, 0, "再跑一次幂等")
+    }
 
     private static func temporaryRoot(_ name: String) -> URL {
         let url = URL(fileURLWithPath: NSTemporaryDirectory())

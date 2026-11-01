@@ -58,6 +58,9 @@ enum ViewMode: String, Codable, CaseIterable, Identifiable {
 
 struct Preferences: Codable, Equatable {
     var maxItems: Int = 500
+    /// 最长保存时间（天）。0 = 不限。
+    /// 到期清理时「收藏」豁免：收藏是用户手动挑出来的，跟"按时间清扫"是两回事。
+    var maxAgeDays: Int = 0
     /// 在 Dock 里隐藏图标。默认关：初始安装时 Dock 显示图标（用户指定，
     /// 1.0.14 由旧的 showInDock 反转而来——语义从"要不要显示"变成"要不要藏"）。
     var hideDockIcon: Bool = false
@@ -88,6 +91,13 @@ struct Preferences: Codable, Equatable {
     /// 面板置顶：打开后失焦也不收起，适合一边看资料一边往里粘贴。
     var alwaysOnTop: Bool = false
 
+    /// 「最长保存时间」的可选值（单位：天，0 = 不限）。显示顺序按用户给的 30/45/60/90/不限。
+    static let maxAgeOptions: [Int] = [30, 45, 60, 90, 0]
+
+    static func maxAgeTitle(_ days: Int) -> String {
+        days > 0 ? "\(days) 天" : "不限"
+    }
+
     static var defaultShortcuts: [String: KeySpec] {
         var table: [String: KeySpec] = [:]
         for action in ShortcutAction.allCases {
@@ -112,6 +122,10 @@ struct Preferences: Codable, Equatable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         let fallback = Preferences()
         maxItems = try container.decodeIfPresent(Int.self, forKey: .maxItems) ?? fallback.maxItems
+        maxAgeDays = try container.decodeIfPresent(Int.self, forKey: .maxAgeDays) ?? fallback.maxAgeDays
+        // 只认选项里的值：手改过配置、或将来改了选项清单的，一律落回「不限」，
+        // 免得 Picker 因为选中项不存在显示空白（音效清单就是这么踩过一次）
+        if !Preferences.maxAgeOptions.contains(maxAgeDays) { maxAgeDays = fallback.maxAgeDays }
         showInDock = try container.decodeIfPresent(Bool.self, forKey: .showInDock)
         // 新键优先；没有新键时从旧键反相迁移（!旧值），保证升级前后 Dock 实际状态不变
         if let legacy = showInDock {
@@ -160,7 +174,7 @@ struct Preferences: Codable, Equatable {
     init() {}
 
     enum CodingKeys: String, CodingKey {
-        case maxItems, hideDockIcon, showInDock, animateStatusIcon, playSound, feedbackSound, autoPaste, pollInterval
+        case maxItems, maxAgeDays, hideDockIcon, showInDock, animateStatusIcon, playSound, feedbackSound, autoPaste, pollInterval
         case ignoreConcealed, captureRichText, defaultView, categories, shortcuts, launchAtLogin
         case panelWidth, panelHeight, alwaysOnTop
     }
