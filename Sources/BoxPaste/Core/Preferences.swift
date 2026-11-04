@@ -90,6 +90,10 @@ struct Preferences: Codable, Equatable {
     var panelHeight: Double = 580
     /// 面板置顶：打开后失焦也不收起，适合一边看资料一边往里粘贴。
     var alwaysOnTop: Bool = false
+    /// 占用到线且空闲时自动重开自己（内存回收，规则见 AutoRestartPolicy）。
+    /// 默认开：动作本身是安全的——先落盘再退出、helper 拉起失败就不退。
+    /// 关掉它 = 用户接受内存随使用增长。
+    var autoRestartEnabled: Bool = true
 
     /// 「最长保存时间」的可选值（单位：天，0 = 不限）。显示顺序按用户给的 30/45/60/90/不限。
     static let maxAgeOptions: [Int] = [30, 45, 60, 90, 0]
@@ -152,6 +156,7 @@ struct Preferences: Codable, Equatable {
         panelWidth = try container.decodeIfPresent(Double.self, forKey: .panelWidth) ?? fallback.panelWidth
         panelHeight = try container.decodeIfPresent(Double.self, forKey: .panelHeight) ?? fallback.panelHeight
         alwaysOnTop = try container.decodeIfPresent(Bool.self, forKey: .alwaysOnTop) ?? fallback.alwaysOnTop
+        autoRestartEnabled = try container.decodeIfPresent(Bool.self, forKey: .autoRestartEnabled) ?? fallback.autoRestartEnabled
 
         // 内置分类必须始终存在：用户升级前删过、或配置来自更早的版本时，
         // 补回来并保留同 id 的用户改动（改名/改规则都算）。
@@ -177,6 +182,7 @@ struct Preferences: Codable, Equatable {
         case maxItems, maxAgeDays, hideDockIcon, showInDock, animateStatusIcon, playSound, feedbackSound, autoPaste, pollInterval
         case ignoreConcealed, captureRichText, defaultView, categories, shortcuts, launchAtLogin
         case panelWidth, panelHeight, alwaysOnTop
+        case autoRestartEnabled
     }
 }
 

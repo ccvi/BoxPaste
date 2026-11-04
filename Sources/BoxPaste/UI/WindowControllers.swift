@@ -418,9 +418,7 @@ final class PanelController: NSObject, NSWindowDelegate {
         window.animationBehavior = .utilityWindow
         window.minSize = NSSize(width: 340, height: 380)
 
-        let hosting = NSHostingView(rootView: PanelRootView().environmentObject(model))
-        hosting.autoresizingMask = [.width, .height]
-        window.contentView = hosting
+        installContent()
 
         // 预览显隐只有模型知道（空格 / Esc / × / 删除条目都会改它），
         // 窗口控制器被动跟随，避免两处各自维护一个"开着吗"的布尔值。
@@ -432,11 +430,43 @@ final class PanelController: NSObject, NSWindowDelegate {
 
     var isVisible: Bool { window.isVisible }
 
+    // ── 视图树装卸 ───────────────────────────────────────────
+
+    /// 装上面板的视图树。init 时装一次；被 teardownContent 拆掉后，
+    /// 下次 show 会重建（见 show 里的 hasContent 分支）。
+    private func installContent() {
+        let hosting = NSHostingView(rootView: PanelRootView().environmentObject(model))
+        hosting.autoresizingMask = [.width, .height]
+        window.contentView = hosting
+    }
+
+    /// 拆掉面板的视图树，把这一整片内存交回系统。
+    ///
+    /// 为什么值得：实测跑四小时的实例 footprint 216MB，其中 SwiftUI 视图图占
+    /// 78.8MB——402 行记录平均每行 190KB，而历史数据本身只有 212KB。
+    /// 面板收起时这棵树没有任何用处；重建耗时见 `--measure-reopen`。
+    ///
+    /// 只拆 contentView，窗口本身（位置/尺寸/level/键盘行为）原样留着。
+    func teardownContent() {
+        window.contentView = nil
+    }
+
+    var hasContent: Bool { window.contentView != nil }
+
+    /// 重建耗时回调（诊断用）：build = 纯构建，show = 含窗口上屏，frame = 到下一帧
+    var onRebuildTiming: ((_ buildMS: Double, _ showMS: Double, _ frameMS: Double) -> Void)?
+
     func toggle() {
         if window.isVisible { hide() } else { show() }
     }
 
     func show() {
+        let started = CFAbsoluteTimeGetCurrent()
+        // 视图树被拆过就先重建（正常路径下 contentView 一直在，这里不会触发）
+        let needsRebuild = !hasContent
+        if needsRebuild { installContent() }
+        let buildMS = (CFAbsoluteTimeGetCurrent() - started) * 1000
+
         let front = NSWorkspace.shared.frontmostApplication
         // 记下"上一个外部应用"，粘贴完把焦点还回去。
         // 如果最前面的是我们自己（比如从设置窗口按热键），就别覆盖掉原来记的那个。
@@ -460,6 +490,15 @@ final class PanelController: NSObject, NSWindowDelegate {
         installMonitor()
         NSApp.bringForward()
         window.makeKeyAndOrderFront(nil)
+
+        guard needsRebuild else { return }
+        let showMS = (CFAbsoluteTimeGetCurrent() - started) * 1000
+        // 下一轮 runloop 才轮到 Core Animation 提交这一帧 —— 那才是用户"看到"面板的时刻
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            let frameMS = (CFAbsoluteTimeGetCurrent() - started) * 1000
+            self.onRebuildTiming?(buildMS, showMS, frameMS)
+        }
     }
 
     func hide() {
@@ -748,6 +787,17 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     /// 所以诊断量到的就是用户关窗时的真实行为。
     func close() {
         window.performClose(nil)
+    }
+
+    /// 自动重启不能把用户正在调设置的窗口抽走
+    var isVisible: Bool { window.isVisible }
+
+    /// 诊断用：把窗口挪到屏幕左上角。截图核对面板排版时，
+    /// 屏幕中部的窗口经常被别的窗口盖住右半边（开关那列就看不见了）。
+    func moveForDiagnostics() {
+        guard let visible = NSScreen.main?.visibleFrame else { return }
+        window.setFrameOrigin(NSPoint(x: visible.minX + 20,
+                                      y: visible.maxY - window.frame.height - 20))
     }
 
     /// 关窗即拆：设置页 700 多行、几十个控件，整棵 SwiftUI 视图树常驻要 17MB

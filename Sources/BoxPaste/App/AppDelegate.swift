@@ -16,6 +16,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: StatusItemController!
     private var panel: PanelController!
     private var settingsWindow: SettingsWindowController?
+    /// 面板重建耗时采样（--measure-reopen）：构建 / 上屏 / 到帧
+    private var reopenSamples: [(build: Double, show: Double, frame: Double)] = []
+    private var reopenRounds = 0
+    private let reopenRoundTarget = 6
+    /// 自动重启：检查定时器与跨进程的计数状态
+    private var autoRestartTimer: Timer?
+    private var autoRestartState = AutoRestartState()
+    /// 上次记录的「到线却没重启」原因，避免每 5 秒写一行同样的日志
+    private var lastAutoRestartSkip = ""
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // 换 bundle id 之后第一次启动：把旧 id 的偏好搬过来。
@@ -37,6 +46,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let model = diagnosticRoot.map { AppModel(store: ClipStore(root: $0)) } ?? AppModel()
         self.model = model
+
+        // 单实例锁必须在任何写盘动作之前拿到：自动重启靠「旧进程退出 → helper 拉起
+        // 新进程」，重叠的那几百毫秒里两个实例会同时写同一份 history.json。
+        // 诊断实例（--store-root）各自用独立目录，锁也各自独立，互不干扰。
+        guard SingleInstanceLock.acquire(in: model.store.root) else {
+            FileHandle.standardError.write(Data("已有实例在使用 \(model.store.root.path)，本次启动退出\n".utf8))
+            exit(0)
+        }
+        // 自动重启的计数要跨进程存活；用户手动打开则全部归零（他指定的规则）
+        autoRestartState = AutoRestartStore.settleOnLaunch(in: model.store.root)
 
         // Dock 策略要在任何窗口出现之前定：先建窗口再切身份，
         // 窗口会带着旧身份的属性（比如不会出现在 ⌘Tab 里）活到下一次切换。
@@ -62,6 +81,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         model.bootstrap()
         model.registerGlobalHotKeys()
+        startAutoRestartMonitor()
 
         // 图标是否真的被摆上了菜单栏，得等系统排完版才知道（见 StatusItemController）。
         // macOS 26 上"创建成功"和"看得见"是两件事，这一步是为了不让图标静悄悄不存在。
@@ -102,6 +122,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if CommandLine.arguments.contains("--show-settings") {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
                 self?.showSettings()
+                // 挪到屏幕左上：截图核对排版时中部容易被别的窗口盖住
+                self?.settingsWindow?.moveForDiagnostics()
+            }
+        }
+
+        if CommandLine.arguments.contains("--measure-reopen") {
+            // 面板视图树「拆掉 → 重建」的耗时测量。
+            // 结论决定要不要做"面板隐藏久了就自动拆"：拆能省 ~79MB 视图图，
+            // 但如果每次呼出要多等 100ms，这个交换就不划算。
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                self?.runReopenMeasurement()
             }
         }
 
@@ -129,6 +160,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
+        if CommandLine.arguments.contains("--measure-teardown") {
+            // 滚完整个列表再拆视图树，量"拆掉到底能回收多少"
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                self?.runTeardownMeasurement()
+            }
+        }
+
         if CommandLine.arguments.contains("--show-panel") || CommandLine.arguments.contains("--show-preview") {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
                 guard let self else { return }
@@ -146,6 +184,215 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         model?.shutdown()
     }
+
+    // ── 自动重启（内存回收）──────────────────────────────────
+
+    /// 每 5 秒看一次：内存到线、用户静下来了、冷却也过了，就重开一次自己。
+    ///
+    /// 为什么用轮询而不是系统内存压力通知：用户要的是**绝对阈值**（250MB），
+    /// 而 memory pressure 是系统视角（全机紧张），两者根本不是一回事。
+    private func startAutoRestartMonitor() {
+        autoRestartTimer?.invalidate()
+        let timer = Timer(timeInterval: 5, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.evaluateAutoRestart() }
+        }
+        // .common：拖窗口、弹菜单时默认模式会暂停定时器
+        RunLoop.main.add(timer, forMode: .common)
+        autoRestartTimer = timer
+    }
+
+    private func evaluateAutoRestart() {
+        // 设置里的开关关了就整个不碰（定时器空转的开销是零）
+        guard model.prefs.value.autoRestartEnabled else { return }
+        // 用户正在看的东西不能被抽走（面板 / 预览 / 设置任一个开着都不动）
+        guard !model.isPanelVisible else { return }
+        guard !model.isPreviewing else { return }
+        guard settingsWindow?.isVisible != true else { return }
+
+        let now = Date()
+        let tuning = autoRestartTuning
+        let decision = AutoRestartPolicy.decide(
+            footprintMB: Support.physFootprintMB,
+            idleFor: now.timeIntervalSince(model.lastActivityAt),
+            state: autoRestartState,
+            now: now,
+            thresholdMB: tuning.threshold,
+            idleSeconds: tuning.idle,
+            cooldownSeconds: tuning.cooldown)
+
+        switch decision {
+        case .restart:
+            performAutoRestart(now: now)
+        case .skip(let reason):
+            // 内存都没到线就别记（否则每 5 秒刷一行）；到线了但没重启的原因要留痕，
+            // 不然用户问"为什么没生效"只能靠猜。
+            guard Support.physFootprintMB >= tuning.threshold,
+                  reason != lastAutoRestartSkip else { return }
+            lastAutoRestartSkip = reason
+            DiagLog.append("自动重启跳过：\(reason)")
+        }
+    }
+
+    /// 端到端验证用的门槛覆盖。
+    ///
+    /// 为什么要有：正式门槛（250MB / 30 秒 / 30 分钟冷却）要挂几小时才可能满足，
+    /// 没法验证「触发 → 落盘 → 退出 → helper 拉起 → 继承计数」这条链路。
+    /// 存在 `/tmp/boxpaste-autorestart-test.trigger` 时把三项都调小；
+    /// **正式使用没有这个文件，一切按用户定的规则走**。
+    private var autoRestartTuning: (threshold: Double, idle: TimeInterval, cooldown: TimeInterval) {
+        let marker = "/tmp/boxpaste-autorestart-test.trigger"
+        guard FileManager.default.fileExists(atPath: marker) else {
+            return (AutoRestartPolicy.thresholdMB,
+                    AutoRestartPolicy.idleSeconds,
+                    AutoRestartPolicy.cooldownSeconds)
+        }
+        return (5, 3, 5)
+    }
+
+    private func performAutoRestart(now: Date) {
+        // 只有装在 /Applications 的正式版才重开自己：诊断实例是 .build 裸产物，
+        // 重开它会变成"打开另一个 app"，而且它的数据目录本来就不是同一个。
+        guard Bundle.main.bundlePath.hasPrefix("/Applications/") else {
+            DiagLog.append("自动重启：非安装版，跳过")
+            lastAutoRestartSkip = "非安装版"
+            return
+        }
+
+        // 先把数据落干净：退出进程会丢掉内存里还没写下去的东西
+        model.store.save()
+        ClipboardWatcher.flushPendingBlobWrites()
+
+        let next = AutoRestartPolicy.advanced(autoRestartState, now: now)
+
+        // helper 起得来才退出。起不来就退出 = 应用彻底消失，比多占几十 MB 严重得多。
+        guard Relauncher.schedule() else {
+            lastAutoRestartSkip = "helper 启动失败"
+            return
+        }
+
+        var pending = next
+        pending.pending = true   // 让下一次启动「继承计数」而不是当成手动打开清零
+        AutoRestartStore.write(pending, in: model.store.root)
+        autoRestartState = next
+        autoRestartTimer?.invalidate()
+        autoRestartTimer = nil
+
+        DiagLog.append(String(format: "自动重启：footprint %.0fMB，24h 窗口内第 %d 次",
+                              Support.physFootprintMB, next.count))
+        NSApp.terminate(nil)
+    }
+
+    // ── 诊断：面板视图树的重建耗时 ───────────────────────────
+
+    /// 反复「拆掉 → 呼出」若干轮，分别记录三段耗时：
+    ///   build = 建 NSHostingView + 绑定 environmentObject
+    ///   show  = 加上定位 / 选中校正 / makeKeyAndOrderFront
+    ///   frame = 到下一轮 runloop（Core Animation 提交这一帧，用户真正"看到"）
+    ///
+    /// 第一轮含一次性成本（字体、TextKit 排版机器之类）单独看；能不能做自动回收
+    /// 要看**热态**（第 2 轮起）的均值——用户平时呼出面板就是热态。
+    private func runReopenMeasurement() {
+        // 先拆掉，保证第一轮走的是重建路径（和"隐藏久了被拆过"完全一致）
+        panel.teardownContent()
+        reopenSamples = []
+        reopenRounds = 0
+
+        panel.onRebuildTiming = { [weak self] build, show, frame in
+            guard let self else { return }
+            self.reopenSamples.append((build: build, show: show, frame: frame))
+            self.reopenRounds += 1
+
+            // 收起再拆，进入下一轮。中间留 200ms，别让上一帧的 CA 提交串进来。
+            self.panel.hide()
+            self.panel.teardownContent()
+            if self.reopenRounds >= self.reopenRoundTarget {
+                self.finishReopenMeasurement()
+            } else {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+                    self?.panel.show()
+                }
+            }
+        }
+        panel.show()
+    }
+
+    private func finishReopenMeasurement() {
+        var lines = ["── BoxPaste 面板重建耗时（\(reopenSamples.count) 轮）──", ""]
+        for (index, sample) in reopenSamples.enumerated() {
+            lines.append(String(format: "第 %d 轮：构建 %.1f ms · 上屏 %.1f ms · 到帧 %.1f ms",
+                                index + 1, sample.build, sample.show, sample.frame))
+        }
+        let warm = reopenSamples.dropFirst()
+        if !warm.isEmpty {
+            let avgFrame = warm.map(\.frame).reduce(0, +) / Double(warm.count)
+            let fastest = warm.map(\.frame).min() ?? 0
+            let avgBuild = warm.map(\.build).reduce(0, +) / Double(warm.count)
+            lines.append("")
+            lines.append(String(format: "热态（第 2 轮起 %d 轮）：构建均值 %.1f ms · 到帧均值 %.1f ms · 最快 %.1f ms",
+                                warm.count, avgBuild, avgFrame, fastest))
+        }
+        lines.append(String(format: "当前 footprint %.1f MB", Support.physFootprintMB))
+        let text = lines.joined(separator: "\n")
+        try? text.write(toFile: "/tmp/boxpaste-reopen.txt", atomically: true, encoding: .utf8)
+        print(text)
+        exit(0)
+    }
+
+    // ── 诊断：面板视图树的回收量 ─────────────────────────────
+
+    /// 把列表从头滚到尾（LazyVStack 会把经过的行都建出来并留着），
+    /// 然后拆掉视图树，量回收了多少。
+    ///
+    /// 为什么必须真滚：一开始怀疑 "216MB 里 78.8MB 视图图" 是因为用户滚过整个列表，
+    /// 只有复现"滚过"这个状态，拆掉的收益才是真的。
+    private var teardownDiagLines: [String] = []
+    private var teardownDiagScrolled = 0
+
+    private func runTeardownMeasurement() {
+        teardownDiagLines = ["── BoxPaste 面板视图树回收测量 ──"]
+        let start = Support.physFootprintMB
+        model.onRequestShowPanel?()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            guard let self else { return }
+            self.teardownDiagLines.append(String(format: "启动 %.1f MB → 呼出后面板 %.1f MB（可见 %d 条）",
+                                                 start, Support.physFootprintMB,
+                                                 self.model.flatVisibleItems.count))
+            self.teardownDiagScrolled = 0
+            self.scrollThroughAllItems()
+        }
+    }
+
+    private func scrollThroughAllItems() {
+        // 每次挪 20 条，21 次覆盖 402 条；到底之后就进入收尾
+        let total = model.flatVisibleItems.count
+        guard teardownDiagScrolled < 24, total > 0 else {
+            finishTeardownMeasurement()
+            return
+        }
+        model.moveSelection(by: 20)
+        teardownDiagScrolled += 1
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
+            self?.scrollThroughAllItems()
+        }
+    }
+
+    private func finishTeardownMeasurement() {
+        let scrolled = Support.physFootprintMB
+        teardownDiagLines.append(String(format: "滚完整个列表：%.1f MB", scrolled))
+        panel.teardownContent()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
+            guard let self else { return }
+            let after = Support.physFootprintMB
+            self.teardownDiagLines.append(String(format: "拆掉视图树：%.1f MB（回收 %.1f MB）",
+                                                 after, scrolled - after))
+            let text = self.teardownDiagLines.joined(separator: "\n")
+            try? text.write(toFile: "/tmp/boxpaste-teardown.txt", atomically: true, encoding: .utf8)
+            print(text)
+            exit(0)
+        }
+    }
+
+
 
     // ── 诊断：预览的内存开销 ─────────────────────────────────
 

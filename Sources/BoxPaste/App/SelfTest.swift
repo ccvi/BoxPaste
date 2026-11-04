@@ -48,6 +48,7 @@ enum SelfTest {
         blobGCTests()
         previewTests()
         memoryHygieneTests()
+        autoRestartTests()
         shortcutTests()
         preferenceTests()
         formatTests()
@@ -520,6 +521,15 @@ enum SelfTest {
             equal(decoded.alwaysOnTop, false, "缺失的置顶开关落回 false")
             equal(decoded.captureRichText, true, "缺失的富文本开关落回 true")
             equal(decoded.maxAgeDays, 0, "缺失的保留期限落回「不限」")
+            // 自动重启用户新加的开关：缺失落回 true（升级前"没有这个功能" = 一直开着）
+            equal(decoded.autoRestartEnabled, true, "缺失的自动重启开关落回 true")
+            // 显式关闭必须被尊重（不能被默认值覆盖）
+            if let off = try? JSONDecoder().decode(Preferences.self,
+                                                   from: Data("{\"autoRestartEnabled\": false}".utf8)) {
+                equal(off.autoRestartEnabled, false, "显式关闭的自动重启被尊重")
+            } else {
+                check(false, "含 autoRestartEnabled 的配置可解码")
+            }
         } else {
             check(false, "旧配置可解码", detail: "字段缺失导致整份解码失败")
         }
@@ -743,6 +753,102 @@ enum SelfTest {
         for index in 0..<80 { _ = ContentClassifier.cachedRegex("^cache-test-\(index)$") }
         check(ContentClassifier.cachedRegex("^cache-test-79$") != nil, "缓存超上限后仍可编译")
         check(ContentClassifier.cachedRegex(#"^\d{3,5}$"#) != nil, "缓存超上限后旧 pattern 可重建")
+    }
+
+    // ── 自动重启策略 ─────────────────────────────────────────
+
+    /// 规则是用户逐条指定的，边界必须钉死：250MB 含等于、30 秒含等于、
+    /// 30 分钟冷却、24 小时内 3 次停用、手动打开重置。
+    private static func autoRestartTests() {
+        func willRestart(_ decision: AutoRestartPolicy.Decision) -> Bool {
+            if case .restart = decision { return true }
+            return false
+        }
+        let now = Date()
+
+        // 阈值：249 不动，250 动
+        check(!willRestart(AutoRestartPolicy.decide(footprintMB: 249, idleFor: 60,
+                                                   state: AutoRestartState(), now: now)),
+              "自动重启：249MB 不触发")
+        check(willRestart(AutoRestartPolicy.decide(footprintMB: 250, idleFor: 60,
+                                                  state: AutoRestartState(), now: now)),
+              "自动重启：250MB 整触发")
+
+        // 空闲：29 秒不动，30 秒动
+        check(!willRestart(AutoRestartPolicy.decide(footprintMB: 300, idleFor: 29,
+                                                   state: AutoRestartState(), now: now)),
+              "自动重启：空闲 29 秒不触发")
+        check(willRestart(AutoRestartPolicy.decide(footprintMB: 300, idleFor: 30,
+                                                  state: AutoRestartState(), now: now)),
+              "自动重启：空闲 30 秒整触发")
+
+        // 冷却
+        let justRestarted = AutoRestartState(count: 1,
+                                             windowStart: now.addingTimeInterval(-3600),
+                                             lastRestartAt: now.addingTimeInterval(-600))
+        check(!willRestart(AutoRestartPolicy.decide(footprintMB: 300, idleFor: 60,
+                                                   state: justRestarted, now: now)),
+              "自动重启：30 分钟冷却内不触发")
+        let cooledDown = AutoRestartState(count: 1,
+                                          windowStart: now.addingTimeInterval(-3600),
+                                          lastRestartAt: now.addingTimeInterval(-1860))
+        check(willRestart(AutoRestartPolicy.decide(footprintMB: 300, idleFor: 60,
+                                                  state: cooledDown, now: now)),
+              "自动重启：冷却 31 分钟后可再触发")
+
+        // 停用 / 窗口过期
+        let exhausted = AutoRestartState(count: 3,
+                                         windowStart: now.addingTimeInterval(-6 * 3600),
+                                         lastRestartAt: now.addingTimeInterval(-1800))
+        check(!willRestart(AutoRestartPolicy.decide(footprintMB: 300, idleFor: 60,
+                                                   state: exhausted, now: now)),
+              "自动重启：24h 内已 3 次 → 停用")
+        let windowExpired = AutoRestartState(count: 3,
+                                             windowStart: now.addingTimeInterval(-25 * 3600),
+                                             lastRestartAt: now.addingTimeInterval(-1800))
+        check(willRestart(AutoRestartPolicy.decide(footprintMB: 300, idleFor: 60,
+                                                  state: windowExpired, now: now)),
+              "自动重启：24h 窗口过期后重新获得机会")
+
+        // 计数推进
+        let windowStart = now.addingTimeInterval(-600)
+        let advanced = AutoRestartPolicy.advanced(AutoRestartState(count: 1,
+                                                                   windowStart: windowStart,
+                                                                   lastRestartAt: windowStart),
+                                                  now: now)
+        equal(advanced.count, 2, "自动重启：窗口内计数 +1")
+        equal(advanced.windowStart, windowStart, "自动重启：窗口内起点不变")
+        let fresh = AutoRestartPolicy.advanced(AutoRestartState(count: 3,
+                                                                windowStart: now.addingTimeInterval(-25 * 3600)),
+                                               now: now)
+        equal(fresh.count, 1, "自动重启：窗口过期后从 1 重新开始")
+        equal(fresh.windowStart, now, "自动重启：窗口起点重置为现在")
+
+        // 状态文件：往返 / 自动拉起继承 / 手动打开重置 / 损坏兜底
+        let root = temporaryRoot("autorestart")
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let state = AutoRestartState(count: 2, windowStart: now, lastRestartAt: now, pending: true)
+        check(AutoRestartStore.write(state, in: root), "自动重启状态：写入成功")
+        equal(AutoRestartStore.read(in: root).count, 2, "自动重启状态：读回计数")
+        check(AutoRestartStore.read(in: root).pending, "自动重启状态：读回 pending 标记")
+
+        let inherited = AutoRestartStore.settleOnLaunch(in: root)
+        equal(inherited.count, 2, "自动拉起：继承计数（不清零）")
+        check(!inherited.pending, "自动拉起：pending 被消费")
+        check(!AutoRestartStore.read(in: root).pending, "自动拉起：磁盘上的 pending 也清掉")
+
+        var manualState = state
+        manualState.pending = false
+        AutoRestartStore.write(manualState, in: root)
+        let manual = AutoRestartStore.settleOnLaunch(in: root)
+        equal(manual.count, 0, "手动打开：计数归零")
+        check(manual.lastRestartAt == nil, "手动打开：冷却时间清空")
+        check(!FileManager.default.fileExists(atPath: AutoRestartStore.url(in: root).path),
+              "手动打开：状态文件被删除")
+
+        try? Data("not json".utf8).write(to: AutoRestartStore.url(in: root))
+        equal(AutoRestartStore.read(in: root), AutoRestartState(), "状态文件损坏：落回默认值")
     }
 
     // ── 保留期限 ─────────────────────────────────────────────

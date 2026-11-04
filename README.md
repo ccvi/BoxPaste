@@ -2,13 +2,13 @@
 
 macOS 菜单栏常驻的剪贴板历史管理器：轮询记录剪贴板，全局热键呼出无边框面板，选中后回写剪贴板并可选模拟 ⌘V。
 
-- 当前版本：**1.0.23**
+- 当前版本：**1.0.24**
 - 作者：ccvi1223 · ccvi1223@qq.com
 - 工程最低版本：`.macOS(.v14)`（`Package.swift`）——不抬到 26 的理由同 BoxMouse 家族：抬上去换不到任何东西，却让 14 / 15 上一行都跑不起来
 
 ---
 
-## 功能（1.0.23 已实现）
+## 功能（1.0.24 已实现）
 
 | 位置 | 能力 |
 | --- | --- |
@@ -135,6 +135,12 @@ Tools/                  make-icon-source.swift、make-icon.swift（被 build-app
 | `--preview-memory` | 预览内存对照实验 |
 | `--show-panel` / `--show-preview` / `--show-settings` | 直接打开对应窗口 |
 | `--keep-alive` | 不退出，便于外部附进程采样 |
+| `--settings-close-test` | 设置窗「关窗即拆」的内存对照（开窗→量→关窗→量→退出） |
+| `--measure-reopen` | 面板视图树重建耗时（决定要不要自动拆视图） |
+| `--measure-teardown` | 滚完列表再拆视图树，量到底能回收多少 |
+
+自动重启的端到端验证用标记文件 `/tmp/boxpaste-autorestart-test.trigger`：存在时门槛降为
+5MB / 空闲 3 秒 / 冷却 5 秒，可以几分钟内跑完「触发→落盘→退出→拉起→继承计数→停用→手动重置」全链路。
 
 ## 数据位置
 

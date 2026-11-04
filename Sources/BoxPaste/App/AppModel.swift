@@ -30,7 +30,12 @@ final class AppModel: ObservableObject {
         // 预览是独立窗口（800×500 居中），显隐由 PanelController 接这个回调去开合。
         // 放在 didSet 里而不是让视图监听，是为了保证"任何路径改的 isPreviewing
         // 都同步到窗口"——空格、Esc、×、删除条目，路径有好几条。
-        didSet { if oldValue != isPreviewing { onPreviewVisibilityChanged?(isPreviewing) } }
+        didSet {
+            if oldValue != isPreviewing {
+                onPreviewVisibilityChanged?(isPreviewing)
+                touchActivity()
+            }
+        }
     }
     @Published var searchFocused = false
     @Published var showsShortcutHelp = false
@@ -82,7 +87,8 @@ final class AppModel: ObservableObject {
     /// 面板是否可见。收起时 refresh 只记脏、不发布 items：
     /// 隐藏窗口里的 SwiftUI 收到 @Published 变化照样会重算整棵列表，
     /// 复制频繁时就是纯烧 CPU（见 refresh / panelDidShow）。
-    private var isPanelVisible = false
+    /// 读开放给 AppDelegate：自动重启要靠它判断"用户是不是正在看"
+    private(set) var isPanelVisible = false
     private var itemsDirty = false
     /// 条目版本号：派生结果（过滤/分区/平铺）缓存的失效依据
     private var itemsVersion = 0
@@ -295,6 +301,8 @@ final class AppModel: ObservableObject {
         // 真实历史覆盖成一条。监听器本来就在装载后才启动（historyDidLoad），
         // 这里是给"面板抢先呼出触发 pollNow"兜底。
         guard historyLoaded else { return }
+        // 有新内容进来 = 用户正在用，自动重启要重新等 30 秒
+        touchActivity()
         let outcome = store.insert(item, maxItems: prefs.value.maxItems)
         store.save()
         refresh()
@@ -442,6 +450,7 @@ final class AppModel: ObservableObject {
     /// 面板打开/收起时由 PanelController 通知。
     func panelDidShow() {
         isPanelVisible = true
+        touchActivity()
         // 慢速轮询期间复制的内容不能等到下一拍：立刻补扫一次。
         // 但装载完成前不能扫（空仓库会被当成真历史落盘），等 historyDidLoad 补。
         watcher.setActive(true)
@@ -457,7 +466,21 @@ final class AppModel: ObservableObject {
 
     func panelDidHide() {
         isPanelVisible = false
+        touchActivity()
         watcher.setActive(false)
+    }
+
+    // ── 空闲判定（自动重启用）────────────────────────────────
+    //
+    // 「空闲」= 用户没在跟这个应用互动：面板收起、没开预览、也没新内容进来。
+    // 自动重启只在真正静下来的时候动手，否则会把用户正在翻的列表抽走。
+
+    /// 最近一次用户活动的时间戳
+    private(set) var lastActivityAt = Date()
+
+    /// 上一次捕获到的内容时间（handleCapture 里刷新）
+    func touchActivity() {
+        lastActivityAt = Date()
     }
 
     private func invalidateFilterCache() {

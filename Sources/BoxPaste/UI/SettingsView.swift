@@ -341,6 +341,13 @@ struct GeneralSettings: View {
             }
         }
 
+        SettingsCard(title: "内存回收") {
+            SettingsRow(label: "占用 250MB 时自动重启",
+                        detail: "空闲 30 秒且内存到线时重开一次自己，把用久了的界面内存还给系统；重启前先保存历史") {
+                SettingsSwitch(isOn: prefs.binding(\.autoRestartEnabled))
+            }
+        }
+
         SettingsCard(title: "数据") {
             SettingsRow(label: "当前占用", detail: storageSummary) {
                 HStack(spacing: 8) {
