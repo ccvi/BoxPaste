@@ -47,6 +47,7 @@ enum SelfTest {
         imageCaptureTests()
         blobGCTests()
         previewTests()
+        memoryHygieneTests()
         shortcutTests()
         preferenceTests()
         formatTests()
@@ -711,6 +712,38 @@ enum SelfTest {
     }
 
     // ── 工具 ─────────────────────────────────────────────────
+
+    // ── 内存口径 / 正则缓存 ──────────────────────────────────
+
+    /// 这两项都属于"算错了不报错、只会悄悄多吃内存或 CPU"的类型，
+    /// 界面上看不出来，只能靠断言钉住口径。
+    private static func memoryHygieneTests() {
+        // 1) 缩略图按**解码后的位图字节**计费（600×600×4 = 1.44MB），
+        //    而不是 PNG 文件字节（平均 132KB）。算错十倍 = 缓存上限形同虚设。
+        let image = NSImage(size: NSSize(width: 600, height: 600))
+        if let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 600, pixelsHigh: 600,
+                                      bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
+                                      isPlanar: false, colorSpaceName: .deviceRGB,
+                                      bytesPerRow: 0, bitsPerPixel: 0) {
+            image.addRepresentation(rep)
+        }
+        equal(ThumbnailCache.bitmapBytes(of: image), 600 * 600 * 4,
+              "缩略图按像素计费（600×600×4）")
+
+        // 2) 同一 pattern 必须复用同一个编译结果
+        let first = ContentClassifier.cachedRegex(#"^\d{3,5}$"#)
+        let second = ContentClassifier.cachedRegex(#"^\d{3,5}$"#)
+        check(first != nil && first === second, "正则缓存命中同一实例")
+
+        // 3) 非法 pattern 返回 nil，且不影响后续编译
+        check(ContentClassifier.cachedRegex("([") == nil, "非法正则返回 nil")
+        check(ContentClassifier.cachedRegex("^ok$") != nil, "非法正则之后仍能正常编译")
+
+        // 4) 超过缓存上限（64）后仍要能正常工作，不能因为整表清空就失效
+        for index in 0..<80 { _ = ContentClassifier.cachedRegex("^cache-test-\(index)$") }
+        check(ContentClassifier.cachedRegex("^cache-test-79$") != nil, "缓存超上限后仍可编译")
+        check(ContentClassifier.cachedRegex(#"^\d{3,5}$"#) != nil, "缓存超上限后旧 pattern 可重建")
+    }
 
     // ── 保留期限 ─────────────────────────────────────────────
 

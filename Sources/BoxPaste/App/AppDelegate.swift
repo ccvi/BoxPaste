@@ -105,6 +105,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
+        if CommandLine.arguments.contains("--settings-close-test") {
+            // 「关窗即拆」的验证入口：开窗 → 量 → 关窗 → 再量。
+            // 为什么必须有这个：`contentView = nil` 之后视图树到底有没有被释放，
+            // 光看代码不算数（NSHostingView 可能被别处持有）。外部 heap 只能
+            // 看到进程总量，分不清是设置窗还是列表；这里把两个时点钉死。
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+                guard let self else { return }
+                self.showSettings()
+                // 留足采样窗口：外部要在这两段里各抓一次 heap
+                DispatchQueue.main.asyncAfter(deadline: .now() + 10) {
+                    print(String(format: "OPENED %.1f MB · 控制器%@",
+                                 Support.physFootprintMB,
+                                 self.settingsWindow == nil ? "缺失" : "已持有"))
+                    self.settingsWindow?.close()
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 8) {
+                        print(String(format: "CLOSED %.1f MB · 控制器%@",
+                                     Support.physFootprintMB,
+                                     self.settingsWindow == nil ? "已释放" : "仍持有"))
+                        exit(0)
+                    }
+                }
+            }
+        }
+
         if CommandLine.arguments.contains("--show-panel") || CommandLine.arguments.contains("--show-preview") {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
                 guard let self else { return }
@@ -205,7 +229,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func showSettings() {
         if settingsWindow == nil {
-            settingsWindow = SettingsWindowController(model: model)
+            let controller = SettingsWindowController(model: model)
+            // 关窗后放掉控制器：设置页的视图树常驻要 17MB（实测），
+            // 而它并非常驻界面。下次点"设置"重建一个新的即可。
+            controller.onClose = { [weak self] in self?.settingsWindow = nil }
+            settingsWindow = controller
         }
         settingsWindow?.show()
     }

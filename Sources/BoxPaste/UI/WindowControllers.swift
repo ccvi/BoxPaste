@@ -705,10 +705,12 @@ final class PanelController: NSObject, NSWindowDelegate {
 // ── 设置窗口 ─────────────────────────────────────────────────
 
 @MainActor
-final class SettingsWindowController {
+final class SettingsWindowController: NSObject, NSWindowDelegate {
 
     private let model: AppModel
     private let window: NSWindow
+    /// 用户关掉设置窗时通知外部把控制器也放掉（下次打开重建）
+    var onClose: (() -> Void)?
 
     init(model: AppModel) {
         self.model = model
@@ -717,14 +719,48 @@ final class SettingsWindowController {
                               backing: .buffered,
                               defer: false)
         window.title = "BoxPaste 设置"
-        window.contentView = NSHostingView(rootView: SettingsRootView().environmentObject(model))
-        window.isReleasedWhenClosed = false      // 关掉只是隐藏，别把 window 释放掉
+        // 关窗后会被拆掉、下次打开重建（见 windowWillClose），所以这里
+        // 别设 isReleasedWhenClosed = true：窗口的生死由我们自己管。
+        window.isReleasedWhenClosed = false
         window.center()
         self.window = window
+        super.init()
+        window.delegate = self
+        installContent()
     }
 
     func show() {
+        // 正常路径下关窗后控制器已被放掉、会重建一个新实例；
+        // 但关闭通知是异步发的，这个空隙里再点"设置"就可能拿到
+        // contentView 已置空的窗口 —— 那会露出一片空白，所以补一次。
+        if window.contentView == nil { installContent() }
         window.makeKeyAndOrderFront(nil)
         NSApp.bringForward()
+    }
+
+    private func installContent() {
+        let hosting = NSHostingView(rootView: SettingsRootView().environmentObject(model))
+        hosting.autoresizingMask = [.width, .height]
+        window.contentView = hosting
+    }
+
+    /// 程序化关闭：走的是和点红点完全相同的路径（performClose → windowWillClose），
+    /// 所以诊断量到的就是用户关窗时的真实行为。
+    func close() {
+        window.performClose(nil)
+    }
+
+    /// 关窗即拆：设置页 700 多行、几十个控件，整棵 SwiftUI 视图树常驻要 17MB
+    /// （实测 32MB → 49MB，且关窗 25 秒后仍不回落）。用户关了就不再需要它，
+    /// 下次打开重建不过几十毫秒，比常驻 17MB 划算得多。
+    nonisolated func windowWillClose(_ notification: Notification) {
+        MainActor.assumeIsolated {
+            // 先拆 contentView：这一步才会释放 NSHostingView 和整棵视图树
+            window.contentView = nil
+            // 再让外部放掉控制器本身。必须挪到下一轮 runloop：
+            // 在关闭回调里同步释放自己，等于在自己的栈上 dealloc。
+            let notify = onClose
+            DispatchQueue.main.async { notify?() }
+        }
     }
 }

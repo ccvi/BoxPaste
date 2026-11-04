@@ -107,19 +107,37 @@ final class ThumbnailCache {
     private let cache = NSCache<NSURL, NSImage>()
 
     private init() {
-        cache.countLimit = 400
-        // 只限条数不限字节的话，长跑下来缩略图位图会把 footprint 顶上去
-        //（内存排查：7 小时从 29MB 涨到 104MB 的组成部分之一）。20MB 封顶。
-        cache.totalCostLimit = 20 * 1024 * 1024
+        // 条数上限只是兜底，真正起作用的是 totalCostLimit。
+        // 一屏约 10 行、上下回看 3~4 屏，200 张足够，再多也命中不到。
+        cache.countLimit = 200
+        // 🔴 cost 必须按**解码后的位图字节**算（见 thumbnail(at:)）。
+        // 以前按文件字节（平均 132KB）计费，而 600px 缩略图解码后是
+        // 600×600×4 ≈ 1.4MB，低估十倍 —— 名义 20MB 上限实际能缓存到
+        // 200MB 位图才触发淘汰，图片记录一多就把 footprint 顶上去。
+        // 24MB ≈ 30 张 600px 缩略图，够覆盖常见滚动范围。
+        cache.totalCostLimit = 24 * 1024 * 1024
     }
 
     func thumbnail(at url: URL) -> NSImage? {
         if let hit = cache.object(forKey: url as NSURL) { return hit }
         guard let image = NSImage(contentsOf: url) else { return nil }
-        // 成本按文件字节算：NSCache 超过 totalCostLimit 时优先淘汰大的
-        let cost = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int) ?? 64 * 1024
-        cache.setObject(image, forKey: url as NSURL, cost: cost)
+        cache.setObject(image, forKey: url as NSURL, cost: Self.bitmapBytes(of: image))
         return image
+    }
+
+    /// 解码后位图占多少字节。NSImage(contentsOf:) 是懒解码，
+    /// 这里只读 representation 的像素尺寸（不解码像素），成本可忽略。
+    /// 非 private：自检要直接断言计费口径（这个数算错就是内存翻十倍）。
+    static func bitmapBytes(of image: NSImage) -> Int {
+        if let rep = image.representations.max(by: { $0.pixelsWide * $0.pixelsHigh < $1.pixelsWide * $1.pixelsHigh }),
+           rep.pixelsWide > 0, rep.pixelsHigh > 0 {
+            return rep.pixelsWide * rep.pixelsHigh * 4
+        }
+        // 拿不到 representation（极少数格式）：按点尺寸 × 2（retina）粗估，
+        // 宁可高估触发淘汰，也别低估把内存撑爆。
+        let width = max(Int(image.size.width * 2), 1)
+        let height = max(Int(image.size.height * 2), 1)
+        return width * height * 4
     }
 
     func forget(_ url: URL) {

@@ -154,10 +154,43 @@ enum ContentClassifier {
         case .textContains:
             return item.searchableText.localizedCaseInsensitiveContains(needle)
         case .textRegex:
-            guard let regex = try? NSRegularExpression(pattern: needle) else { return false }
+            guard let regex = cachedRegex(needle) else { return false }
             let range = NSRange(item.searchableText.startIndex..., in: item.searchableText)
             return regex.firstMatch(in: item.searchableText, range: range) != nil
         }
+    }
+
+    // ── 正则缓存 ─────────────────────────────────────────────
+    //
+    // 为什么必须缓存：matches 会被「分类数 × 条目数」次调用
+    //（rebuildCategoryCounts 就是 4 个分类 × 402 条 = 1608 次），
+    // 而 NSRegularExpression(pattern:) 编译一次要几十微秒 —— 每次刷新
+    // 白烧几十毫秒 CPU。pattern 来自用户配置、总共就那么几条，缓存下来毫无压力。
+    //
+    // 加锁：目前调用都在主线程，但这是纯函数层的共享可变状态，
+    // 将来放到后台算（比如异步刷新）时会静默数据竞争，锁的成本远低于编译。
+
+    private static var regexCache: [String: NSRegularExpression] = [:]
+    private static let regexCacheLock = NSLock()
+    /// 规则条数本来就少；给个上限防止长期运行下无限增长
+    private static let regexCacheLimit = 64
+
+    static func cachedRegex(_ pattern: String) -> NSRegularExpression? {
+        regexCacheLock.lock()
+        if let hit = regexCache[pattern] {
+            regexCacheLock.unlock()
+            return hit
+        }
+        regexCacheLock.unlock()
+
+        // 编译放在锁外：编译是慢操作，别让并发调用排队等它
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
+
+        regexCacheLock.lock()
+        if regexCache.count >= regexCacheLimit { regexCache.removeAll(keepingCapacity: true) }
+        regexCache[pattern] = regex
+        regexCacheLock.unlock()
+        return regex
     }
 
     /// 条目命中的所有分类（规则命中 ∪ 手动归入）
@@ -174,7 +207,8 @@ enum ContentClassifier {
     /// 取第一个匹配的各捕获组（下标 0 是整串）。捕获组没参与匹配时给空串，
     /// 于是调用方不用到处写 optional 解包。
     private static func firstMatch(_ pattern: String, in text: String) -> [String]? {
-        guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
+        // 走同一份缓存：颜色解析在每次 kind 判定时都会调（402 条就是 402 次编译）
+        guard let regex = cachedRegex(pattern) else { return nil }
         let range = NSRange(text.startIndex..., in: text)
         guard let match = regex.firstMatch(in: text, range: range) else { return nil }
         var groups: [String] = []

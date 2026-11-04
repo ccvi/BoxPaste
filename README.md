@@ -2,13 +2,13 @@
 
 macOS 菜单栏常驻的剪贴板历史管理器：轮询记录剪贴板，全局热键呼出无边框面板，选中后回写剪贴板并可选模拟 ⌘V。
 
-- 当前版本：**1.0.20**
+- 当前版本：**1.0.23**
 - 作者：ccvi1223 · ccvi1223@qq.com
 - 工程最低版本：`.macOS(.v14)`（`Package.swift`）——不抬到 26 的理由同 BoxMouse 家族：抬上去换不到任何东西，却让 14 / 15 上一行都跑不起来
 
 ---
 
-## 功能（1.0.20 已实现）
+## 功能（1.0.23 已实现）
 
 | 位置 | 能力 |
 | --- | --- |
@@ -97,9 +97,16 @@ Tools/                  make-icon-source.swift、make-icon.swift（被 build-app
    安装段必须是 `ditto` + `xattr -cr` + cdhash 比对，**不能跟一句 `codesign --force --sign -`**
    ——那句会把证书覆盖回 ad-hoc，症状是"装完看着一切正常，自动粘贴一条都不触发"。
    另：固定证书下仍然不要附加受限授权（`com.apple.developer.*`），会让 launchd spawn 失败（POSIX 163）
-4. **热键注册 API 的"先注册后清理"形状是刻意的**：早先的写法在 `register()` 内部先 `unregisterAll()`，于是注册第二个热键时把第一个一起清了，表现是**呼出热键静默失效**
-5. **热键回调闭包不能捕获上下文**：它被当成 C 函数指针传下去
-6. **`LSUIElement` 应用的最小主菜单不能删**：没有系统菜单栏，文本框就按不出 ⌘C / ⌘V / ⌘A
+4. 🔴 **`NSCache` 的 cost 必须按"解码后的位图字节"算，不是文件字节**。
+   缩略图 PNG 文件平均 132KB，解码成 600px 位图是 1.44MB —— 按文件字节计费等于
+   把上限低估十倍，名义 20MB 实际能缓存到 200MB 位图才淘汰（图片记录一多就顶爆
+   footprint）。见 `ThumbnailCache.bitmapBytes(of:)`，自检有断言钉住这个口径。
+5. 🔴 **正则要缓存编译结果**。`NSRegularExpression(pattern:)` 一次 4.9μs，
+   而 `rebuildCategoryCounts` 是「分类数 × 条目数」次调用（402×4=1608 次/刷新）——
+   不缓存就是每次刷新白烧 7.8ms。见 `ContentClassifier.cachedRegex(_:)`。
+6. **热键注册 API 的"先注册后清理"形状是刻意的**：早先的写法在 `register()` 内部先 `unregisterAll()`，于是注册第二个热键时把第一个一起清了，表现是**呼出热键静默失效**
+7. **热键回调闭包不能捕获上下文**：它被当成 C 函数指针传下去
+8. **`LSUIElement` 应用的最小主菜单不能删**：没有系统菜单栏，文本框就按不出 ⌘C / ⌘V / ⌘A
 
 ## 版本规则
 
@@ -139,8 +146,14 @@ Tools/                  make-icon-source.swift、make-icon.swift（被 build-app
 | 面板位置 | UserDefaults 键 `com.pcxx.boxpaste.panelOriginX / Y` |
 | 开机启动 | `~/Library/LaunchAgents/com.pcxx.boxpastemac.plist` |
 
-缩略图缓存只在内存里（`NSCache`，400 条 / 20 MB），**不落盘**。
+缩略图缓存只在内存里（`NSCache`，200 条 / 24 MB，**按解码后的位图字节计费**），不落盘。
+设置窗是**关掉就拆**的：`contentView` 置 nil、控制器一并释放，下次打开重建
+（实测：402 条记录下设置窗视图树 = 9.3 万个对象 / 7.8 MB 活对象，常驻纯属浪费）。
 
 ## 一个已经量过的结论
 
-1.0.20 实测：macOS 26 上 `malloc_zone_pressure_relief` **恒返回 0** —— 现在的分配器 free 时就把页还给内核了，所谓"释放内存"在这里没有可释放的对象。做过对照实验才敢下这个结论，别再重复实现一遍。
+1.0.20 实测：macOS 26 上 `malloc_zone_pressure_relief` **恒返回 0**，调用它没有任何作用，别再实现一遍。
+
+1.0.23 实测（402 条记录、跑 4 小时的实例）：footprint 216MB 里，`heap` 活对象 107MB，其中 **SwiftUI 视图图 78.8MB（74%）**，而历史数据本身只有 212KB（history.json）。换句话说，这个应用的内存几乎全花在「界面结构」上：每行记录平均 190KB 视图图。
+真正能降的只有两条路——**不让视图树常驻**（设置窗关掉即拆，已做；面板视图树还在，要拆得先量重建延迟）和**别让缓存上限算错**（缩略图计费，已修）。
+另：分配器不是"free 就还页"，而是**整块 region 空了才还**——设置窗拆掉后 footprint 掉了 5.4MB，但小块反复分配回收的部分会一直留着，所以"内存数字不降"常见、并不等于泄漏。
