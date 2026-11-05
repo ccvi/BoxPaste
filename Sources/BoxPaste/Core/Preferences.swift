@@ -21,13 +21,13 @@ enum ViewMode: String, Codable, CaseIterable, Identifiable {
 
     /// ⌥数字快捷键的编号（WindowControllers 里 ⌥1/2/3 按视图**类型**绑定；
     /// ⌘1-9 已让位给"直接粘贴第 N 条"——Maccy 的习惯键位，更高频）。
-    /// 顶部按钮的显示顺序（丰富→简洁→网格，用户指定）与它无关——
+    /// 编号顺序（丰富→简洁→网格，用户 2026-11-05 指定）与顶部按钮的显示顺序一致；
     /// 按钮换了位置快捷键还认类型，tooltip 的编号要从这里取，别用显示下标。
     var shortcutDigit: Int {
         switch self {
-        case .grid:    return 1
+        case .rich:    return 1
         case .compact: return 2
-        case .rich:    return 3
+        case .grid:    return 3
         }
     }
 

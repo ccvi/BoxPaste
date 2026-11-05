@@ -688,9 +688,9 @@ final class PanelController: NSObject, NSWindowDelegate {
         // 3.5) ⌥组合：视图切换（原来在 ⌘1/2/3 上，⌘1-9 让位给快捷粘贴后挪到这里）
         if event.modifierFlags.contains(.option), !event.modifierFlags.contains(.command) {
             switch Int(event.keyCode) {
-            case kVK_ANSI_1: model.setViewMode(.grid); return nil
+            case kVK_ANSI_1: model.setViewMode(.rich); return nil
             case kVK_ANSI_2: model.setViewMode(.compact); return nil
-            case kVK_ANSI_3: model.setViewMode(.rich); return nil
+            case kVK_ANSI_3: model.setViewMode(.grid); return nil
             default: break
             }
         }
