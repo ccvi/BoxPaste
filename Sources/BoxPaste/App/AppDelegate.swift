@@ -167,6 +167,63 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
+        // 批量粘贴的端到端验证：--batch-paste-test[=N] 或 /tmp 下的触发文件。
+        // 为什么要触发文件：`open -a X.app --args --flag` 实测**不传参**，
+        // 而 .app 内的二进制又不许直接 exec（见 build-app.sh 的自检说明），
+        // 于是只剩"启动后读一个标记文件"这条路。
+        // 为什么需要这个验证：这条链路唯一致命的未知是**节奏**（间隔太短目标应用
+        // 会丢条目），而节奏只有真的往一个文档里粘一次才看得出来。
+        // 结果写 /tmp：经 open 启动时拿不到 stdout。
+        let triggerPath = "/tmp/boxpaste-batch-test.trigger"
+        let wantsBatchTest = CommandLine.arguments.contains { $0.hasPrefix("--batch-paste-test") }
+            || FileManager.default.fileExists(atPath: triggerPath)
+        if wantsBatchTest {
+            // 触发文件内容：`3` 或 `3:12345`（条数:目标应用 pid）。
+            // 为什么必须能指定 pid：`open -a` 会把前台交给**我们自己**，
+            // 不指目标的话 ⌘V 全打在自己身上，接收端一个字都收不到 —— 会假通过。
+            var count = 3
+            var targetPID: pid_t?
+            func parseSpec(_ spec: String) {
+                let parts = spec.trimmingCharacters(in: .whitespacesAndNewlines).split(separator: ":")
+                if let first = parts.first, let parsed = Int(first) { count = parsed }
+                if parts.count > 1, let pid = Int32(parts[1]) { targetPID = pid }
+            }
+            if let arg = CommandLine.arguments.first(where: { $0.hasPrefix("--batch-paste-test") }),
+               let value = arg.split(separator: "=").dropFirst().first {
+                parseSpec(String(value))
+            } else if let text = try? String(contentsOfFile: triggerPath, encoding: .utf8) {
+                parseSpec(text)
+            }
+            try? FileManager.default.removeItem(atPath: triggerPath)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+                guard let self else { return }
+                // 面板没显示过时 refresh() 只记脏不发布 items（省得给隐藏窗口重算列表），
+                // 所以这里要先把脏数据落地，否则取到的永远是空列表
+                self.model.panelDidShow()
+                // 跳掉置顶：它们是常驻的固定块，会把可预期的 3 条挤出取样范围
+                let picks = Array(self.model.flatVisibleItems.filter { !$0.pinned }.prefix(count))
+                var log = ["[\(Date())] 批量粘贴验证 条数=\(count) 辅助功能=\(Paster.isAccessibilityTrusted)"]
+                log.append("取件：" + picks.map { String($0.text.prefix(12)).replacingOccurrences(of: "\n", with: "⏎") }
+                    .joined(separator: " | "))
+                let expect = Double(picks.count) * 0.25 + 3
+                // 把目标应用钉死并推到前台：正常使用时这一步由 panel.previousApp 完成
+                if let targetPID, let external = NSRunningApplication(processIdentifier: targetPID) {
+                    self.model.pasteTargetProvider = { external }
+                    external.activate()
+                    log.append("目标：\(external.localizedName ?? "?") pid=\(targetPID)")
+                }
+                self.model.multiSelection = Set(picks.map(\.id))
+                self.model.pasteMultiSelection()
+                DispatchQueue.main.asyncAfter(deadline: .now() + expect) {
+                    log.append("结束")
+                    try? log.joined(separator: "\n").write(toFile: "/tmp/boxpaste-batch-test.log",
+                                                           atomically: true, encoding: .utf8)
+                    print(log.joined(separator: "\n"))
+                    exit(0)
+                }
+            }
+        }
+
         if CommandLine.arguments.contains("--show-panel") || CommandLine.arguments.contains("--show-preview") {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
                 guard let self else { return }

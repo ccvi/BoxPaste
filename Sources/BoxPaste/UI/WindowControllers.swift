@@ -457,11 +457,35 @@ final class PanelController: NSObject, NSWindowDelegate {
     var onRebuildTiming: ((_ buildMS: Double, _ showMS: Double, _ frameMS: Double) -> Void)?
 
     func toggle() {
-        if window.isVisible { hide() } else { show() }
+        // 🔴 判据不能用 window.isVisible：它只说明"窗口在窗口服务器上"，
+        // 不说明"用户看得见"。面板是 .nonactivatingPanel，当抢激活被系统拒掉
+        // （前台是全屏应用、别的应用开着模态、刚从锁屏回来）时，窗口会被摆上台
+        // 却从没成为 key；而唯一的自动收起入口是 windowDidResignKey ——
+        // 没成为 key 就永远收不起来。于是 isVisible 一直为真、眼前什么都没有，
+        // toggle 一按就走 hide()，症状就是"按了完全没反应，再按几次才出来"
+        // （用户实测原话）。occlusionState 只回答"这一帧里它有没有被画出来"，
+        // 正好是这里要的判据。
+        let onScreen = window.isVisible && window.occlusionState.contains(.visible)
+        if onScreen {
+            hide()
+        } else if window.isVisible {
+            // 在台上但看不见 / 没拿到键盘：顶到最前，而不是把它关掉
+            bringOnScreen()
+        } else {
+            show()
+        }
     }
 
     func show() {
         let started = CFAbsoluteTimeGetCurrent()
+
+        // 台上已有窗口（上面那种"看得见状态、看不见窗口"）：重新顶上来就行，
+        // 不能再走一遍完整 show —— 那会把分类/搜索重置掉，用户会觉得"我刚翻到一半的列表没了"
+        if window.isVisible {
+            bringOnScreen()
+            return
+        }
+
         // 视图树被拆过就先重建（正常路径下 contentView 一直在，这里不会触发）
         let needsRebuild = !hasContent
         if needsRebuild { installContent() }
@@ -478,6 +502,7 @@ final class PanelController: NSObject, NSWindowDelegate {
         // 列表得在选中/分类这些后续动作之前先补齐，否则 ensureValidSelection
         // 会在空列表上把选中项清掉。
         model.panelDidShow()
+        let dataMS = (CFAbsoluteTimeGetCurrent() - started) * 1000 - buildMS
 
         positionWindow()
         // 每次呼出都落在「全部」上（用户指定：默认分类是全部，不是收藏）。
@@ -490,15 +515,49 @@ final class PanelController: NSObject, NSWindowDelegate {
         installMonitor()
         NSApp.bringForward()
         window.makeKeyAndOrderFront(nil)
+        let orderMS = (CFAbsoluteTimeGetCurrent() - started) * 1000
 
-        guard needsRebuild else { return }
-        let showMS = (CFAbsoluteTimeGetCurrent() - started) * 1000
-        // 下一轮 runloop 才轮到 Core Animation 提交这一帧 —— 那才是用户"看到"面板的时刻
+        // 下一轮 runloop 才轮到 Core Animation 提交这一帧 —— 那才是用户"看到"面板的时刻。
+        // 这一段不 return：非重建路径也要走，否则"呼出偏慢"永远没有留痕。
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             let frameMS = (CFAbsoluteTimeGetCurrent() - started) * 1000
-            self.onRebuildTiming?(buildMS, showMS, frameMS)
+            if needsRebuild { self.onRebuildTiming?(buildMS, orderMS, frameMS) }
+            // 只在真的慢时写一行：正常呼出 46ms 级，每次都写等于给热路径加一次磁盘 IO
+            if frameMS > 120 {
+                DiagLog.append(String(format: "呼出偏慢：数据 %.1f · 上屏 %.1f · 到帧 %.1f ms（重建 %@，%d 条）",
+                                      dataMS, orderMS - buildMS - dataMS, frameMS,
+                                      needsRebuild ? "是" : "否", self.model.items.count))
+            }
         }
+    }
+
+    /// 把"已经在台上、但看不见 / 没拿到键盘"的面板重新顶到最前。
+    ///
+    /// 为什么不重跑 panelDidShow 的重活：这条分支是用户连按热键时走的，
+    /// 列表状态本来就是好的，再扫一遍剪贴板、重建一遍索引只会让"没反应"更久。
+    /// 数据补扫放在窗口之后（见末尾），保证先出画面。
+    private func bringOnScreen() {
+        let started = CFAbsoluteTimeGetCurrent()
+        // 诊断路径可能先拆了视图树又留着窗口：这时顶上来的是个空窗口
+        if !hasContent { installContent() }
+        let front = NSWorkspace.shared.frontmostApplication
+        if let front, front.bundleIdentifier != Bundle.main.bundleIdentifier {
+            previousApp = front
+        }
+        positionWindow()
+        installMonitor()
+        NSApp.bringForward()
+        // orderFrontRegardless：激活被系统拒掉时普通 orderFront 会一直排队等激活，
+        // 这个"不管前台是谁、先摆上来"的变体才能保证窗口真的出现在当前屏幕上。
+        window.orderFrontRegardless()
+        // 面板收不到键入 = 没成为 key。makeKey 是这里的关键动作：
+        // 不补这一句，窗口出来了但搜索框打不进字、上下键也没反应。
+        window.makeKey()
+        let orderMS = (CFAbsoluteTimeGetCurrent() - started) * 1000
+        DiagLog.append(String(format: "面板重新上屏：%.1f ms（此前 isVisible=true 但不可见 / 非 key）", orderMS))
+        // 藏着的这段时间可能的复制只记了脏标记，这里补一次（排在窗口之后，不挡上屏）
+        model.panelDidShow()
     }
 
     func hide() {

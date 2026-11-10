@@ -14,6 +14,7 @@
 #   ./build-app.sh --identity X   指定签名身份（默认自动挑本地固定证书）
 #   ./build-app.sh --bump         强制版本号 +1（即使源码没变）
 #   ./build-app.sh --no-bump      保持版本号不变（指纹照常更新）
+#   ./build-app.sh --no-dmg       不生成 dmg 安装包（只留 dist/Xxx.app）
 #   ./build-app.sh --clean        先清掉 .build 再构建
 #
 # 关于签名（这条踩过真坑，别改回去）：
@@ -46,6 +47,7 @@ DO_INSTALL=0
 FORCE_BUMP=0
 SKIP_BUMP=0
 DO_CLEAN=0
+DO_DMG=1
 SWIFT_FLAGS=()
 # 空字符串 = 还没定，下面按本机有没有固定证书自动挑
 SIGN_IDENTITY=""
@@ -58,6 +60,7 @@ for argument in "$@"; do
         --install)    DO_INSTALL=1 ;;
         --bump)       FORCE_BUMP=1 ;;
         --no-bump)    SKIP_BUMP=1 ;;
+        --no-dmg)     DO_DMG=0 ;;
         --clean)      DO_CLEAN=1 ;;
         --identity)
             # 值放在下一个位置参数里：这里用 while 取会打乱 for 的遍历，
@@ -65,7 +68,7 @@ for argument in "$@"; do
             NEED_IDENTITY_VALUE=1
             ;;
         -h|--help)
-            sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'
+            sed -n '2,41p' "$0" | sed 's/^# \{0,1\}//'
             exit 0
             ;;
         *)
@@ -382,6 +385,59 @@ if [[ "$DO_INSTALL" == "1" ]]; then
         exit 1
     fi
     echo "  ✓ 已安装：/Applications/$APP_NAME.app（cdhash ${INSTALL_HASH:0:12}…，签名未被改动）"
+fi
+
+# ------------------------------------------------------------
+# 8. dmg 安装包
+#
+# 顺序铁律：**先签 app，再打 dmg**。反过来就得把 dmg 挂起来重签里面的 app，
+# cdhash 一变「辅助功能」授权立刻作废（见文件头签名说明）。
+#
+# 暂存目录里只放两样东西：签好名的 app + 指向 /Applications 的软链接。
+# 用户把图标拖进去就等于装好了 —— 这是 mac 用户的肌肉记忆，少一个软链
+# 就得让人自己去 Finder 里翻 /Applications。
+# ------------------------------------------------------------
+if [[ "$DO_DMG" == "1" ]]; then
+    echo ""
+    echo "▶ 生成 dmg 安装包…"
+    DMG_PATH="$DIST_DIR/${APP_NAME}-${APP_VERSION}.dmg"
+    DMG_STAGE="$(mktemp -d)"
+    # ditto 而不是 cp -R：保留签名封存，复制完还是那份 cdhash
+    ditto "$APP_DIR" "$DMG_STAGE/$APP_NAME.app"
+    ln -s /Applications "$DMG_STAGE/Applications"
+    rm -f "$DMG_PATH"
+    # UDZO = zlib 压缩：体积小、挂载快；UDRO 只在需要现场写盘时才有必要
+    if hdiutil create -volname "$DISPLAY_NAME" -srcfolder "$DMG_STAGE" \
+        -ov -format UDZO "$DMG_PATH" > /tmp/boxpaste-dmg.log 2>&1; then
+        echo "  ✓ $DMG_PATH"
+    else
+        echo "  ✗ dmg 创建失败，日志：/tmp/boxpaste-dmg.log" >&2
+        tail -5 /tmp/boxpaste-dmg.log | sed 's/^/    /' >&2
+        rm -rf "$DMG_STAGE"
+        exit 1
+    fi
+    rm -rf "$DMG_STAGE"
+
+    # 挂起来比对里面那份 app 的 cdhash：不比对的话，出现「dmg 里装出来的
+    # 东西跟验证过的不是一份」时完全无声（TCC 授权会莫名其妙失效）。
+    DMG_MNT="$(mktemp -d)"
+    if hdiutil attach -nobrowse -readonly -mountpoint "$DMG_MNT" "$DMG_PATH" > /dev/null 2>&1; then
+        DMG_HASH=$(codesign -dvvv "$DMG_MNT/$APP_NAME.app" 2>&1 | awk -F= '/^CDHash=/ {print $2; exit}')
+        hdiutil detach "$DMG_MNT" > /dev/null 2>&1 || hdiutil detach "$DMG_MNT" -force > /dev/null 2>&1
+        APP_HASH=$(codesign -dvvv "$APP_DIR" 2>&1 | awk -F= '/^CDHash=/ {print $2; exit}')
+        if [[ -n "$DMG_HASH" && "$DMG_HASH" == "$APP_HASH" ]]; then
+            echo "  ✓ dmg 内的 app 与构建产物 cdhash 一致（${DMG_HASH:0:12}…）"
+        elif [[ -z "$DMG_HASH" ]]; then
+            echo "  ⚠ dmg 内 app 未签名（--no-sign），跳过 cdhash 比对"
+        else
+            echo "  ✗ dmg 内的 app cdhash 与构建产物不一致（${DMG_HASH:0:12} ≠ ${APP_HASH:0:12}）" >&2
+            exit 1
+        fi
+    else
+        echo "  ⚠ dmg 挂载失败，没能核对里面的 cdhash" >&2
+    fi
+    rmdir "$DMG_MNT" 2>/dev/null || true
+    du -sh "$DMG_PATH" | sed 's/^/  体积 /'
 fi
 
 cat <<'TIPS'

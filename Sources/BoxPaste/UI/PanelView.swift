@@ -324,6 +324,13 @@ struct MultiSelectBar: View {
                 .font(.system(size: 12, weight: .medium))
                 .monospacedDigit()
             Spacer(minLength: 8)
+            // 主操作放最左：多选的目的一半就是"把这几条按顺序粘出去"。
+            // 只在这里给按钮，不做 ⌘↩ 之类的新键位——多选状态下误按回车
+            // 会把一整批内容灌进目标文档，撤销起来比删除麻烦得多。
+            Button("粘贴") { model.pasteMultiSelection() }
+                .controlSize(.small)
+                .buttonStyle(.bordered)
+                .help("按列表顺序逐条粘贴选中的 \(model.multiSelection.count) 项")
             Button("收藏") { model.addMultiSelectionToFavorites() }
                 .controlSize(.small)
                 .buttonStyle(.bordered)

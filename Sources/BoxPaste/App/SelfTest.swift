@@ -50,6 +50,7 @@ enum SelfTest {
         memoryHygieneTests()
         autoRestartTests()
         shortcutTests()
+        batchPasteTests()
         preferenceTests()
         formatTests()
 
@@ -504,6 +505,31 @@ enum SelfTest {
         }
         check(!duplicated, "默认快捷键之间没有冲突")
         equal(ShortcutAction.allCases.count, seen.count, "每个动作都有独立默认键")
+
+        // 快捷键速查表：键位不能重复（照着按会互相矛盾），
+        // 且必须写明 ⌘+点击多选 —— 面板里那张速查表是用户唯一能发现该手势的地方
+        let fixedKeys = ShortcutAction.fixedShortcuts.map(\.keys)
+        equal(Set(fixedKeys).count, fixedKeys.count, "固定快捷键速查表无重复键位")
+        check(fixedKeys.contains { $0.contains("点击") }, "速查表包含 ⌘+点击 多选")
+    }
+
+    // ── 批量粘贴 ─────────────────────────────────────────────
+
+    private static func batchPasteTests() {
+        let a = ClipboardWatcher.textItem("第 1 条")
+        let b = ClipboardWatcher.textItem("第 2 条")
+        let c = ClipboardWatcher.textItem("第 3 条")
+        let visible = [a, b, c]
+
+        // 取件顺序必须跟屏幕上的顺序一致，不能是 Set 的遍历顺序：
+        // 用户勾选时看到的就是这个次序，粘出来不一样会以为漏了或粘重了
+        equal(AppModel.orderedSelection([c.id, a.id], from: visible).map(\.id), [a.id, c.id],
+              "批量粘贴按显示顺序取件")
+        equal(AppModel.orderedSelection([], from: visible).count, 0, "空选择不产生粘贴队列")
+        equal(AppModel.orderedSelection([UUID(), b.id], from: visible).map(\.id), [b.id],
+              "不在当前列表里的 id 被丢掉（搜索/分类过滤后仍安全）")
+        equal(AppModel.orderedSelection(Set(visible.map(\.id)), from: visible).count, 3,
+              "全选时三条都进队列")
     }
 
     // ── 配置兼容 ─────────────────────────────────────────────

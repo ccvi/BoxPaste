@@ -53,6 +53,12 @@ final class AppModel: ObservableObject {
     @Published private(set) var isPaused = false
     /// 多选批量操作：⌘单击逐个勾选，工具条上做批量删除/收藏。
     @Published var multiSelection: Set<UUID> = []
+    /// 批量粘贴队列。面板这时已经收起，驱动方只能是模型自己 ——
+    /// 放在视图里等着随面板一起销毁就等于半路断掉。
+    private var batchPasteQueue: [ClipItem] = []
+    private var batchPasteTotal = 0
+    private var batchPasteDone = 0
+    private var batchPasteRunning = false
 
     let store: ClipStore
     let prefs: PreferencesStore
@@ -451,6 +457,8 @@ final class AppModel: ObservableObject {
     func panelDidShow() {
         isPanelVisible = true
         touchActivity()
+        // 面板被重新叫出来 = 用户不想继续批量粘了（见 cancelBatchPaste）
+        cancelBatchPaste()
         // 慢速轮询期间复制的内容不能等到下一拍：立刻补扫一次。
         // 但装载完成前不能扫（空仓库会被当成真历史落盘），等 historyDidLoad 补。
         watcher.setActive(true)
@@ -623,6 +631,123 @@ final class AppModel: ObservableObject {
         showHint(added > 0 ? "已把 \(added) 项加入收藏" : "所选内容都已在收藏里")
     }
 
+    // ── 批量粘贴 ─────────────────────────────────────────────
+
+    /// 逐条之间的间隔。0.25s 是"目标应用来得及处理完上一次粘贴"的经验下界：
+    /// 压到 0.1s 时 Word / 浏览器会丢条目 —— 上一次的 ⌘V 还在键盘队列里，
+    /// 剪贴板就已经被下一条 clearContents 覆盖了，粘出来是重复的上一条。
+    private static let batchPasteInterval: TimeInterval = 0.25
+
+    /// 批量粘贴的取件顺序：按**当前显示顺序**（置顶在前，其余按时间/搜索命中），
+    /// 不是 Set 的遍历顺序。用户勾选时看到的就是屏幕上的次序，
+    /// 粘出来的顺序跟眼睛对不上，会让人以为漏了或者粘重了。
+    /// 纯函数，挂 nonisolated 才好被自检（非主线程）直接调
+    nonisolated static func orderedSelection(_ selection: Set<UUID>, from visible: [ClipItem]) -> [ClipItem] {
+        guard !selection.isEmpty else { return [] }
+        return visible.filter { selection.contains($0.id) }
+    }
+
+    /// 逐条粘贴选中的条目。
+    /// 剪贴板只有一格，所以"批量"只能是一条条来：写一条 → 替用户按 ⌘V →
+    /// 等目标应用吃下去 → 写下一條。中途用户重新呼出面板就等于取消。
+    func pasteMultiSelection() {
+        // 队列还在跑的时候重复点，直接忽略：叠加会变成两条链同时改剪贴板，
+        // 粘出来必然是乱的。
+        guard !batchPasteRunning else { return }
+        let targets = Self.orderedSelection(multiSelection, from: flatVisibleItems)
+        guard !targets.isEmpty else { return }
+
+        var trace = ["—— \(Date()) 批量粘贴 \(targets.count) 项 ——"]
+
+        // 没有自动粘贴（或没授权）就不该假装能批量粘：那只会让用户点完
+        // 看着面板消失、目标应用里只多了一条，以为功能坏了。
+        // 退化成本次"只复制第一条"+说明原因，面板留着，用户能立刻去授权。
+        if !prefs.value.autoPaste {
+            trace.append("✗ 自动粘贴未开启，退化为只复制第一条")
+            Self.appendTrace(trace.joined(separator: "\n") + "\n")
+            if let first = targets.first { _ = Paster.write(first, store: store, watcher: watcher) }
+            showHint("批量粘贴要开「自动粘贴」（设置 → 通用）：它替你一条条按 ⌘V")
+            return
+        }
+        if !Paster.isAccessibilityTrusted {
+            trace.append("✗ 未授权，退化为只复制第一条")
+            Self.appendTrace(trace.joined(separator: "\n") + "\n")
+            if let first = targets.first { _ = Paster.write(first, store: store, watcher: watcher) }
+            showHint("批量粘贴需要辅助功能授权（设置 → 通用 → 自动粘贴）")
+            return
+        }
+        trace.append("顺序：" + targets.map { $0.kind.rawValue }.joined(separator: " → "))
+        Self.appendTrace(trace.joined(separator: "\n") + "\n")
+
+        batchPasteQueue = targets
+        batchPasteTotal = targets.count
+        batchPasteDone = 0
+        batchPasteRunning = true
+        multiSelection = []
+        onRequestHidePanel?()
+        onReactivatePreviousApp?()
+        // 第一条必须等焦点真的回到目标应用：没回到位就发 ⌘V，
+        // 键会打在自己（已经收起但仍在前台）身上，第一条静默丢失。
+        waitUntilPasteTargetFrontmost { [weak self] _ in
+            self?.runBatchPasteStep()
+        }
+    }
+
+    private func runBatchPasteStep() {
+        guard batchPasteRunning else { return }
+        guard !batchPasteQueue.isEmpty else {
+            finishBatchPaste()
+            return
+        }
+        let item = batchPasteQueue.removeFirst()
+        // 图片/文件可能已经被外部删掉：跳过这一条继续，不要整批停在这儿
+        guard Paster.write(item, store: store, watcher: watcher) else {
+            Self.appendTrace("批量粘贴：第 \(batchPasteDone + 1) 条内容已不在，跳过\n")
+            scheduleBatchPasteStep()
+            return
+        }
+        store.bump(item.id)
+        let sent = Paster.sendPasteKeystroke()
+        batchPasteDone += 1
+        Self.appendTrace("批量粘贴：\(batchPasteDone)/\(batchPasteTotal) \(sent ? "✓" : "✗ 发送失败")\n")
+        scheduleBatchPasteStep()
+    }
+
+    private func scheduleBatchPasteStep() {
+        guard batchPasteRunning else { return }
+        guard !batchPasteQueue.isEmpty else {
+            finishBatchPaste()
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.batchPasteInterval) { [weak self] in
+            self?.runBatchPasteStep()
+        }
+    }
+
+    private func finishBatchPaste() {
+        guard batchPasteRunning else { return }
+        batchPasteRunning = false
+        batchPasteQueue = []
+        batchPasteTotal = 0
+        // 一串 bump 之后统一落盘一次：这是"最近使用"排序，粘完顺序已经定了，
+        // 每条都 save 等于 5KB×N 次写盘，白费
+        store.save()
+        refresh()
+        Self.appendTrace("批量粘贴：结束，共 \(batchPasteDone) 条\n")
+    }
+
+    /// 用户又把面板叫出来了 = 不想再粘了。
+    /// 不停的话下一拍写剪贴板 + 发 ⌘V 会把内容粘进我们自己的搜索框。
+    private func cancelBatchPaste() {
+        guard batchPasteRunning else { return }
+        batchPasteRunning = false
+        batchPasteQueue = []
+        batchPasteTotal = 0
+        store.save()
+        refresh()
+        Self.appendTrace("批量粘贴：面板重新呼出，中止（已粘 \(batchPasteDone) 条）\n")
+    }
+
     // ── 快捷位置粘贴 ─────────────────────────────────────────
 
     /// ⌘1-9 直接粘贴列表第 N 条。N 按**当前显示顺序**算，但**置顶的不算**
@@ -708,7 +833,9 @@ final class AppModel: ObservableObject {
     /// 还没切走焦点的自己（或半路插进来的 Finder）身上。
     /// 轮询比对 pid：不对就再催一次 activate，最多等 ~1.2s；
     /// 发键时把目标/实际最前台都记进日志，再失败日志直接给出真凶。
-    private func sendPasteWhenFrontmost(attempt: Int = 0) {
+    /// 批量粘贴复用同一套等待（第一条尤其要紧），所以抽成参数化版本。
+    private func waitUntilPasteTargetFrontmost(attempt: Int = 0,
+                                               then action: @escaping (Int) -> Void) {
         let front = NSWorkspace.shared.frontmostApplication
         let target = pasteTargetProvider?()
         // 没记到目标（比如面板从我们自己的设置窗口呼出）就退化为"不是自己"
@@ -719,18 +846,26 @@ final class AppModel: ObservableObject {
             reached = front?.bundleIdentifier != Bundle.main.bundleIdentifier
         }
         if reached || attempt >= 24 {
-            let sent = Paster.sendPasteKeystroke()
-            Self.appendTrace("模拟 ⌘V：\(sent ? "✓ 已发出" : "✗ 发送失败")"
-                + " · 目标=\(target?.localizedName ?? "未记录")"
-                + " · 实际最前面=\(front?.localizedName ?? "nil")"
-                + " · 等了 \(attempt) 轮\n")
+            action(attempt)
             return
         }
         // 焦点还没到位：activate 是异步的，每 4 轮（0.2s）重新催一次，
         // 防止上一次激活请求丢了。
         if attempt % 4 == 3 { onReactivatePreviousApp?() }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
-            self?.sendPasteWhenFrontmost(attempt: attempt + 1)
+            self?.waitUntilPasteTargetFrontmost(attempt: attempt + 1, then: action)
+        }
+    }
+
+    private func sendPasteWhenFrontmost() {
+        waitUntilPasteTargetFrontmost { attempt in
+            let front = NSWorkspace.shared.frontmostApplication
+            let target = self.pasteTargetProvider?()
+            let sent = Paster.sendPasteKeystroke()
+            Self.appendTrace("模拟 ⌘V：\(sent ? "✓ 已发出" : "✗ 发送失败")"
+                + " · 目标=\(target?.localizedName ?? "未记录")"
+                + " · 实际最前面=\(front?.localizedName ?? "nil")"
+                + " · 等了 \(attempt) 轮\n")
         }
     }
 

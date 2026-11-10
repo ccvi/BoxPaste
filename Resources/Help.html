@@ -78,7 +78,7 @@
 <main>
 
   <h1>BoxPaste 使用帮助</h1>
-  <p class="sub">常驻菜单栏的剪贴板历史工具 · 版本 1.0.24</p>
+  <p class="sub">常驻菜单栏的剪贴板历史工具 · 版本 1.0.27</p>
 
   <h2>它是什么</h2>
   <p>BoxPaste 在你复制任何内容时默默记一条，需要时按 <kbd>⇧</kbd><kbd>⌘</kbd><kbd>V</kbd> 呼出面板挑回来。默认不占 Dock，启动后看菜单栏多出来的剪贴板图标。</p>
@@ -106,12 +106,20 @@
     <tr><td><kbd>⌥</kbd>+<kbd>1</kbd>/<kbd>2</kbd>/<kbd>3</kbd></td><td>切换 丰富列表 / 简洁列表 / 网格</td></tr>
     <tr><td><kbd>⌘</kbd>+<kbd>F</kbd> / <kbd>⌘</kbd>+<kbd>L</kbd></td><td>聚焦搜索框 / 清空搜索</td></tr>
     <tr><td>直接打字</td><td>不用点搜索框就能开始搜（多个词是「都要包含」）</td></tr>
-    <tr><td><kbd>⌘</kbd>+点击</td><td>多选：逐个勾选条目，工具条上批量删除 / 收藏</td></tr>
+    <tr><td><kbd>⌘</kbd>+点击</td><td>多选：逐个勾选条目，工具条上批量粘贴 / 收藏 / 删除</td></tr>
     <tr><td><kbd>⌘</kbd>+<kbd>A</kbd></td><td>全选当前列表进入多选（<kbd>Esc</kbd> 退出）</td></tr>
     <tr><td><kbd>⌘</kbd>+<kbd>Z</kbd></td><td>撤销上一次删除（批量删除也算一次）</td></tr>
     <tr><td><kbd>Tab</kbd></td><td>切换分类</td></tr>
     <tr><td><kbd>Esc</kbd></td><td>逐层退出：多选 → 预览 → 清搜索 → 关面板</td></tr>
   </table>
+
+  <h2>批量粘贴</h2>
+  <ul>
+    <li><b>怎么用</b>：按住 <kbd>⌘</kbd> 点选多条（或按 <kbd>⌘A</kbd> 全选），工具条上点「<b>粘贴</b>」。</li>
+    <li><b>效果</b>：按列表显示顺序，一条接一条粘到刚才那个应用里，每条之间隔 0.25 秒（间隔太短目标应用会丢条目）。</li>
+    <li><b>中止</b>：粘贴过程中再按一次呼出热键把面板叫出来，剩下的就不再粘了。</li>
+    <li><b>前提</b>：需要「自动粘贴」和辅助功能授权（跟单条粘贴一样）；没开的话只会复制第一条，并在面板上提示原因。</li>
+  </ul>
 
   <h2>分类、收藏与置顶</h2>
   <ul>
@@ -159,7 +167,7 @@
   <h2>关于</h2>
   <p>作者：ccvi1223 · 邮箱：<a href="mailto:ccvi1223@qq.com">ccvi1223@qq.com</a></p>
 
-  <footer>BoxPaste 1.0.24 · 这份帮助随应用一起打包，离线可看</footer>
+  <footer>BoxPaste 1.0.27 · 这份帮助随应用一起打包，离线可看</footer>
 
 </main>
 </body>
