@@ -124,6 +124,24 @@ final class AppModel: ObservableObject {
         Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0.0"
     }
 
+    // ── 预览 ─────────────────────────────────────────────────
+
+    /// 主动关闭预览（× / 删除条目 / Esc 都走这里，别直接写 `isPreviewing = false`）。
+    ///
+    /// 🔴 `didSet` 只在**值真的变了**时才跑。一旦模型这侧已经是 false
+    /// （选中项变化时被顺手清掉、或某条路径先清了模型却没把窗口收掉），
+    /// 再赋一次 false 就是空操作 —— 窗口还在台上、× 点了毫无反应，
+    /// 用户看到的就是"有时候翻译完，右上角关不掉"。
+    /// 所以值没变时也要补一次通知，让窗口控制器无论如何收一次。
+    func closePreview() {
+        if isPreviewing {
+            isPreviewing = false          // didSet 会通知窗口收起
+        } else {
+            DiagLog.append("关闭预览：模型已是 false，补一次收起通知（窗口与模型脱节）")
+            onPreviewVisibilityChanged?(false)
+        }
+    }
+
     // ── 生命周期 ─────────────────────────────────────────────
 
     /// prefs 用 optional 而不是 `= PreferencesStore()`：默认参数表达式在**调用方**

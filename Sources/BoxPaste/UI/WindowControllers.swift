@@ -424,7 +424,20 @@ final class PanelController: NSObject, NSWindowDelegate {
         // 窗口控制器被动跟随，避免两处各自维护一个"开着吗"的布尔值。
         model.onPreviewVisibilityChanged = { [weak self] visible in
             guard let self else { return }
-            if visible { self.preview.show() } else { self.hidePreview() }
+            if visible {
+                // 🔴 这段时间里 AppKit 正在做 key window 交接：面板的 windowDidResignKey
+                // 会**先**送达，而那一刻 `NSApp.keyWindow` 可能已经是 nil（应用未激活时
+                // 尤其如此）。于是"键盘是不是在自己窗口上"判成否 → hide() 把面板收掉，
+                // 连带 hidePreview() + isPreviewing=false；可 makeKeyAndOrderFront 还没走完，
+                // 紧接着又把预览窗摆回台上 —— 结果就是**预览窗在台上、模型里 isPreviewing
+                // 已经是 false**，再点 × 赋一次 false 不触发 didSet，按钮彻底失效。
+                // 用一个标志挡掉这段过渡，比查 keyWindow 可靠。
+                self.isOpeningPreview = true
+                self.preview.show()
+                self.isOpeningPreview = false
+            } else {
+                self.hidePreview()
+            }
         }
     }
 
@@ -657,18 +670,44 @@ final class PanelController: NSObject, NSWindowDelegate {
         // 这时候收起来等于让这个开关没有意义。
         if model.prefs.value.alwaysOnTop { return }
 
+        // 正在把预览窗顶到前台（见 onPreviewVisibilityChanged 里的说明）：
+        // 这时的 resignKey 是开预览的副作用，不是"用户离开了面板"。
+        if isOpeningPreview { return }
+
+        // 🔴 键盘交给了我们**自己的预览窗**，这不叫"离开面板"。
+        // 面板和预览是两个独立的 NSPanel，点预览里的任何控件（比如「翻译」）
+        // 预览都会接过 key，面板随即收到 resignKey；照旧逻辑收起面板，
+        // `hide()` 里会连预览一起收掉 —— 用户看到的就是"点翻译，窗口直接关了"，
+        // 翻译根本没机会跑。hidePreview() 里已经会把键盘还给面板，不需要在这里补。
+        if isKeyboardOnOwnWindow { return }
+
         // 拖拽输出时鼠标键还按着，这时候窗口失焦**不能**收：
         // 一收源窗口就没了，拖到一半的东西直接作废。
         if NSEvent.pressedMouseButtons != 0 {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
                 guard let self, self.window.isVisible, !self.window.isKeyWindow,
                       NSEvent.pressedMouseButtons == 0 else { return }
+                // 0.6 秒后用户可能已经点进预览窗了，同样不能收
+                if self.isKeyboardOnOwnWindow { return }
                 self.hide()
             }
             return
         }
         hide()
     }
+
+    /// 键盘是不是落在我们自己的某个窗口上（面板本身或预览窗）。
+    /// 外部应用抢走焦点时返回 false —— 那才是该自动收起的场景。
+    private var isKeyboardOnOwnWindow: Bool {
+        // keyWindow 为 nil 时不能一律当成"还在自己窗口上"：应用被切到后台时它也是 nil
+        // （实测 CLI 启动的实例就是这种），那正是该收起的场景。只有"预览正在打开的过渡中"
+        // 才算自己——其余一律按离开处理，保持"切到别的应用就收起"的原有手感。
+        guard let key = NSApp.keyWindow else { return isOpeningPreview }
+        return key === window || key === preview.nsWindow
+    }
+
+    /// 正在把预览窗顶到前台。见 onPreviewVisibilityChanged / windowDidResignKey。
+    private var isOpeningPreview = false
 
     // ── 键盘路由 ─────────────────────────────────────────────
 
@@ -721,7 +760,7 @@ final class PanelController: NSObject, NSWindowDelegate {
         case kVK_Escape:
             // 逐层退出：多选 → 预览 → 快捷键帮助 → 搜索词 → 面板
             if !model.multiSelection.isEmpty { model.clearMultiSelection() }
-            else if model.isPreviewing { model.isPreviewing = false }
+            else if model.isPreviewing { model.closePreview() }
             else if model.showsShortcutHelp { model.showsShortcutHelp = false }
             else if !model.query.isEmpty { model.query = "" }
             else { hide() }

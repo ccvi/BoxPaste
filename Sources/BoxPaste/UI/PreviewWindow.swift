@@ -20,6 +20,25 @@ import SwiftUI
 private final class PreviewWindow: NSPanel {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { false }
+
+    /// 事件派发**之前**先把 key 拿回来。
+    ///
+    /// AppKit 对非 key 窗口的处理是"这一下鼠标只用来抢焦点"，随即把控件动作丢掉。
+    /// 这里先 makeKey，随后的 super 派发就照常规走，第一下点击就落在按钮上。
+    override func sendEvent(_ event: NSEvent) {
+        if event.type == .leftMouseDown, !isKeyWindow { makeKey() }
+        super.sendEvent(event)
+    }
+}
+
+/// 预览窗的宿主视图：**允许第一下点击直接落到控件上**。
+///
+/// AppKit 的默认规矩是"点一下只用来把窗口变成 key，控件动作丢掉"。预览窗
+/// 开着的时候，几种情况都会让它不再是 key：翻译弹出的系统语言包面板拿走焦点、
+/// 切到别的应用看一眼再回来、点了语言下拉。回来第一下点右上角 × 就被吞掉，
+/// 表现出来正是"关闭按钮失效，再点一下才好"。这里让它直接接受第一下点击。
+private final class PreviewHostingView<Content: View>: NSHostingView<Content> {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 }
 
 @MainActor
@@ -48,7 +67,7 @@ final class PreviewWindowController {
         window.animationBehavior = .utilityWindow
         window.isMovableByWindowBackground = false
 
-        let hosting = NSHostingView(rootView: PreviewWindowRoot().environmentObject(model))
+        let hosting = PreviewHostingView(rootView: PreviewWindowRoot().environmentObject(model))
         hosting.autoresizingMask = [.width, .height]
         window.contentView = hosting
     }
@@ -64,8 +83,12 @@ final class PreviewWindowController {
         // 没有选中项就没有可看的东西，直接不出现
         guard model.selectedItem != nil else { return }
         window.setFrame(centeredFrame(), display: false)
-        // orderFront 而不是 makeKey：键盘留给面板，用户点进来才接管
-        window.orderFront(nil)
+        // 🔴 makeKey 而不是 orderFront：非 key 窗口的**第一下点击只用来抢焦点**，
+        // 控件动作会被吞掉 —— 用户点「翻译」看起来毫无反应，必须再点一次（实测）。
+        // 键盘交给预览后不会失能：空格 / Esc / 方向键仍由 PanelController 的按键路由处理
+        // （handle 的 guard 同时认预览窗），面板也不会因为失焦而收起
+        // （见 PanelController.windowDidResignKey 里"键盘在自己窗口上就不收"的分支）。
+        window.makeKeyAndOrderFront(nil)
     }
 
     func hide() {

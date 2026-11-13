@@ -51,6 +51,8 @@ enum SelfTest {
         autoRestartTests()
         shortcutTests()
         batchPasteTests()
+        translateTests()
+        previewTextStyleTests()
         preferenceTests()
         formatTests()
 
@@ -511,6 +513,171 @@ enum SelfTest {
         let fixedKeys = ShortcutAction.fixedShortcuts.map(\.keys)
         equal(Set(fixedKeys).count, fixedKeys.count, "固定快捷键速查表无重复键位")
         check(fixedKeys.contains { $0.contains("点击") }, "速查表包含 ⌘+点击 多选")
+    }
+
+    // ── 预览字号 ─────────────────────────────────────────────
+    //
+    // 富文本那段是唯一有逻辑的地方（要按 run 换字号、还要保住粗体/颜色），
+    // 纯文本只是引用一个常量，不必测。
+
+    private static func previewTextStyleTests() {
+        equal(Int(PreviewCard.bodyFontSize), 14, "预览正文字号 14pt")
+        equal(Int(PreviewCard.bodyLineSpacing), 4, "预览正文行距 +4pt（14pt 字约 21pt 行高）")
+
+        let rich = NSMutableAttributedString(
+            string: "粗体正文",
+            attributes: [.font: NSFont.boldSystemFont(ofSize: 33)])
+        rich.addAttribute(.foregroundColor, value: NSColor.systemRed,
+                          range: NSRange(location: 0, length: 2))
+        let out = PreviewCard.resizedRichText(rich)
+        let font = out.attribute(.font, at: 0, effectiveRange: nil) as? NSFont
+        equal(Int(font?.pointSize ?? 0), 14, "富文本正文被统一到 14pt")
+        check(font.map { NSFontManager.shared.traits(of: $0).contains(.boldFontMask) } ?? false,
+              "富文本缩字号后粗体保留")
+        check(out.attribute(.foregroundColor, at: 0, effectiveRange: nil) != nil,
+              "富文本颜色属性保留")
+
+        // 行距只在视图上加（.lineSpacing），富文本也一样：实测 SwiftUI 的 Text
+        // 不采纳 NSParagraphStyle.lineSpacing，段落样式这条路是死的。
+        // 所以这里只钉两件事：常量值对，以及**没动**源文档的段落样式。
+        let styled = NSMutableParagraphStyle()
+        styled.lineSpacing = 0
+        styled.alignment = .center
+        styled.firstLineHeadIndent = 18
+        let original = NSAttributedString(string: "居中的一段",
+                                          attributes: [.paragraphStyle: styled])
+        let kept = PreviewCard.resizedRichText(original)
+        let keptStyle = kept.attribute(.paragraphStyle, at: 0, effectiveRange: nil) as? NSParagraphStyle
+        check(keptStyle?.alignment == .center, "富文本只换字号，不动源文档的居中对齐")
+        check(Int(keptStyle?.firstLineHeadIndent ?? 0) == 18, "富文本只换字号，不动源文档的首行缩进")
+
+        // 没带字体属性的 run（有些 RTF 只在段落样式里写字号）：要补上正文字体，不能留成默认大小
+        let plain = NSAttributedString(string: "没有字体属性")
+        let filled = PreviewCard.resizedRichText(plain)
+        equal(Int((filled.attribute(.font, at: 0, effectiveRange: nil) as? NSFont)?.pointSize ?? 0), 14,
+              "没带字体的富文本补上 14pt")
+    }
+
+    // ── 预览翻译 ─────────────────────────────────────────────
+    //
+    // 全是纯逻辑：语种判定、按行分流、目标语言记忆。真正的翻译要系统语言包，
+    // 属于"这台机器现在什么样"，不进自检（跟剪贴板/GUI 同一个理由）。
+
+    private static func translateTests() {
+        check(TranslateTarget.allCases.map(\.title) == ["中文", "英文"], "翻译目标两档：中文 / 英文")
+        check(TranslateTarget.chinese.short == "中" && TranslateTarget.english.short == "英",
+              "收起状态只显示一个字（样张是「中 ⌄」）")
+        check(TranslateTarget.chinese.languageIdentifier == "zh-Hans"
+                && TranslateTarget.english.languageIdentifier == "en",
+              "语言标识写规范（中文必须 zh-Hans）")
+
+        let suite = "com.pcxx.boxpaste.selftest.translate"
+        let defaults = UserDefaults(suiteName: suite)!
+        defaults.removePersistentDomain(forName: suite)
+        check(TranslateTarget.remembered(defaults) == .chinese, "没记住过 → 回落到中文")
+
+        // 🔴 同语种翻译会被系统框架拒掉（实测 TranslationError/1 → 界面上一句
+        // 「翻译失败：Unable to Translate」）。所以默认目标要按文字本身猜。
+        check(TranslateTarget.defaultFor("The Fed kept rates unchanged.") == .chinese, "英文内容默认译成中文")
+        check(TranslateTarget.defaultFor("美联储维持利率不变。") == .english, "中文内容默认译成英文")
+        check(TranslateTarget.looksChinese("我用 macOS 的 Screenshot 工具截了图"), "中英混排（汉字占比高）判成中文")
+        check(!TranslateTarget.looksChinese("The app is called 截图 and it works well on macOS 26 devices"),
+              "纯英文里的零星汉字不算中文")
+        check(!TranslateTarget.looksChinese("   "), "空文本不算中文")
+        check(TranslateTarget.looksChinese("，。、「」"), "中文标点也算中文（「」，。）")
+
+        check(TranslateTarget.cjkRatio("中文") == 1, "汉字占比：纯中文是 1")
+        check(TranslateTarget.cjkRatio("hello world") == 0, "汉字占比：纯英文是 0")
+        check(TranslateTarget.cjkRatio("   ") == 0, "汉字占比：空文本是 0（不除零）")
+
+        // 源语种显式判：不让框架自己认（混排它认不出来，会弹系统面板要用户选）
+        check(TranslateTarget.sourceLanguage(for: "整屏遮罩窗口指定色彩空间") == .chinese, "源语种：中文为主 → 中文")
+        check(TranslateTarget.sourceLanguage(for: "窗口不指定 colorSpace 时系统按广色域给") == .chinese,
+              "源语种：混排但中文为主 → 中文")
+        check(TranslateTarget.sourceLanguage(for: "IOSurface 57.8M Drawable") == .english, "源语种：纯英文 → 英文")
+
+        // 每行该不该翻
+        check(TranslateTarget.needsTranslation("IOSurface 57.8M Drawable", into: .chinese), "译中文：纯英文行要翻")
+        check(!TranslateTarget.needsTranslation("整屏遮罩窗口指定色彩空间", into: .chinese), "译中文：中文行不用翻")
+        check(TranslateTarget.needsTranslation("整屏遮罩窗口指定色彩空间", into: .english), "译英文：中文行要翻")
+        check(!TranslateTarget.needsTranslation("IOSurface 57.8M Drawable", into: .english), "译英文：纯英文行不用翻")
+        check(!TranslateTarget.needsTranslation("   ", into: .chinese)
+                && !TranslateTarget.needsTranslation("", into: .english),
+              "空行两边都不翻")
+
+        // 分段方案：相邻同类合并、只派该翻的活、整篇同语种不派活
+        let mixed = """
+        The cache keeps a strong reference.
+        缓存持有一个强引用。
+        Drawable is 57.8MB.
+        """
+        let plan = TranslateTarget.plan(for: mixed, into: .chinese)
+        equal(plan.pendingTexts.count, 2, "混排译中文：只派出两段英文（相邻同类已合并）")
+        check(plan.source == .english, "混排译中文：源语种判成英文")
+        equal(plan.pieces.count, 3, "混排译中文：切回三段（英文块 / 中文块 / 英文块）")
+
+        let allChinese = TranslateTarget.plan(for: "只有中文。\n还是中文。", into: .chinese)
+        check(!allChinese.hasWork && allChinese.source == nil, "整篇已经是中文 → 不派活（交给框架只会被拒）")
+        let allEnglish = TranslateTarget.plan(for: "Only English here.\nStill English.", into: .english)
+        check(!allEnglish.hasWork, "整篇已经是英文 → 不派活")
+
+        // ── 「保留原文」逐句对照 ──────────────────────────────
+        // 对照模式必须逐行送翻：配对的前提就是一行对一行。
+        // 复用分块方案会让一块回来是多行，再按 \n 拆回去行数对不上。
+        let bilingual = """
+        The cache keeps a strong reference.
+        缓存持有一个强引用。
+        
+        The watch dog is 57.8MB.
+        The watch dog is 57.8MB.
+        """
+        equal(TranslateTarget.linesNeedingTranslation(bilingual, into: .chinese),
+              ["The cache keeps a strong reference.", "The watch dog is 57.8MB."],
+              "对照模式：只送该翻的行，重复行只翻一次（保持出现顺序）")
+
+        let translations = [
+            "The cache keeps a strong reference.": "缓存保留强引用。",
+            "The watch dog is 57.8MB.": "看门狗占 57.8MB。",
+        ]
+        let pairs = TranslateTarget.bilingualPairs(bilingual, into: .chinese, translations: translations)
+        equal(pairs.count, 5, "对照结果与原文行数一致（空行也占一对，保住段落结构）")
+        equal(pairs.map(\.id), [0, 1, 2, 3, 4], "配对用行号做 id（空行/重复行不会撞）")
+        equal(pairs[0].translation ?? "", "缓存保留强引用。", "英文行配上译文")
+        check(pairs[1].translation == nil, "本来就是中文的行不重复显示（translation 为 nil）")
+        check(pairs[2].original.isEmpty && pairs[2].translation == nil, "空行只有原文、没有译文")
+        equal(pairs[3].translation ?? "", "看门狗占 57.8MB。", "重复行各自都拿到译文")
+
+        // 框架漏回某一行时不能把原文当译文显示（否则同一句会出现两遍）
+        let partial = TranslateTarget.bilingualPairs(bilingual, into: .chinese,
+                                                    translations: ["The watch dog is 57.8MB.": "看门狗占 57.8MB。"])
+        check(partial[0].translation == nil, "漏译的行只显示原文一次，不拿原文顶替译文")
+
+        let joined = TranslateTarget.joinedTranslation(pairs)
+        equal(joined.components(separatedBy: "\n").count, 5, "复制译文：行数不变")
+        check(joined.hasPrefix("缓存保留强引用。\n缓存持有一个强引用。"), "复制译文：能译的用译文、不能译的保留原文")
+
+        // 「复制」按钮在对照模式复制的是**原文 + 译文**（用户明确要求"复制所有的文本内容"）
+        let both = TranslateTarget.joinedBilingual(pairs)
+        check(both.hasPrefix("The cache keeps a strong reference.\n缓存保留强引用。\n缓存持有一个强引用。"),
+              "复制：原文在上、译文在下；不用翻的行只出现一次")
+        equal(both.components(separatedBy: "\n").count, 8,
+              "复制：5 行原文里 3 行有译文 → 8 行（原文 5 + 译文 3）")
+        check(both != joined, "「复制」与「只复制译文」是两份不同的内容")
+
+        check(!TranslateTarget.rememberedKeepOriginal(defaults), "「保留原文」默认不勾（保持整段替换的老行为）")
+        TranslateTarget.rememberKeepOriginal(true, defaults)
+        check(TranslateTarget.rememberedKeepOriginal(defaults), "「保留原文」勾选状态记得住")
+
+        TranslateTarget.remember(.english, defaults)
+        check(TranslateTarget.remembered(defaults) == .english, "记住的语言读得回来")
+        check(TranslateTarget.initial(for: "美联储维持利率不变。", defaults) == .english,
+              "记住过就优先用记住的（不再按内容猜）")
+        defaults.removePersistentDomain(forName: suite)
+
+        // 翻译能力跟着系统走：macOS 15 起才有 Translation 框架
+        let major = ProcessInfo.processInfo.operatingSystemVersion.majorVersion
+        check(TranslationSupport.isAvailable == (major >= 15), "系统翻译可用性与 macOS 版本一致（15 起步）")
+        check(TranslationSupport.unavailableNote.contains("macOS 15"), "不可用时有明确说明，不是空白按钮")
     }
 
     // ── 批量粘贴 ─────────────────────────────────────────────

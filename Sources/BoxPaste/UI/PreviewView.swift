@@ -25,6 +25,16 @@ struct PreviewCard: View {
     @State private var previewLoadFailed = false
     // 富文本条目的 RTF 渲染结果（后台解析，主线程只收成品）
     @State private var richPreview: NSAttributedString?
+    // 译文（nil = 正在看原文）。和原文分开存：翻译是"看一眼"的动作，
+    // 覆盖掉原文就没法对照，切回原文也只能重开预览。
+    @State private var translatedText: String?
+    // 勾了「保留原文」时才有：逐句对照用的"一行原文 + 一行译文"。
+    // 和 translatedText 并存而不是二选一 —— 字数统计、整段模式复制还是用整段那份。
+    @State private var translatedPairs: [BilingualPair]?
+    // 对照开关：记住上次的选择（使用习惯，每次重开预览都要重勾很烦）
+    @State private var keepOriginal = TranslateTarget.rememberedKeepOriginal()
+    // 目标语言：没记住过就按内容猜（中文内容 → 英文），避免同语种翻译被框架拒掉
+    @State private var translateTarget: TranslateTarget = .chinese
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -67,11 +77,17 @@ struct PreviewCard: View {
             }
             Spacer(minLength: 0)
             Button {
-                model.isPreviewing = false
+                // closePreview() 而不是 `isPreviewing = false`：值已经是 false 时
+                // 赋值不会触发 didSet，窗口就永远收不掉（见 AppModel.closePreview）
+                model.closePreview()
             } label: {
                 Image(systemName: "xmark.circle.fill")
                     .font(.system(size: 14))
                     .foregroundStyle(.tertiary)
+                    // 图标本身只有 14pt，点击热区太小 —— 稍微偏一点就"点了没反应"。
+                    // 撑到 24×24 并显式给命中形状，手指/触控板都不用瞄。
+                    .frame(width: 24, height: 24)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .help("关闭预览（空格 / Esc）")
@@ -157,6 +173,10 @@ struct PreviewCard: View {
         .task(id: item.id) {
             // 换了条目或重开预览都重新解析一遍 RTF
             richPreview = nil
+            // 译文只对当前这一条有效：换了条目还挂着上一条的译文是最典型的错位
+            translatedText = nil
+            translatedPairs = nil
+            translateTarget = TranslateTarget.initial(for: item.text)
             guard let name = item.rtfBlobName,
                   let data = try? Data(contentsOf: model.store.blobURL(named: name)) else { return }
             let loaded = await Task.detached(priority: .userInitiated) { () -> NSAttributedString? in
@@ -174,8 +194,9 @@ struct PreviewCard: View {
     private var richTextContent: some View {
         if let rich = richPreview,
            rich.length <= Self.previewCharLimit,
-           let converted = try? AttributedString(rich, including: \.appKit) {
+           let converted = try? AttributedString(Self.resizedRichText(rich), including: \.appKit) {
             Text(converted)
+                .lineSpacing(Self.bodyLineSpacing)   // 富文本也走视图行距，段落样式那条路无效（见 resizedRichText）
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
         } else {
@@ -183,8 +204,44 @@ struct PreviewCard: View {
         }
     }
 
+    /// 富文本正文统一到 `bodyFontSize`。
+    ///
+    /// RTF 里带的是复制时那一刻的字号（12/13pt 混着），不覆盖就会出现
+    /// "纯文本 14pt、富文本 12pt"的割裂 —— 用户看到的预览忽大忽小。
+    /// 只换字号，粗体/斜体/颜色/链接/对齐/缩进等属性原样保留
+    /// （用 NSFontManager.convert 保住字族与 traits）。
+    ///
+    /// 🔴 行距**不在这里**做。实测（2026-11-11）：把 `NSParagraphStyle.lineSpacing = 4`
+    /// 写进 attributed string，SwiftUI 的 `Text` 完全不采纳 —— 三行文本量高度，
+    /// 段落样式填 4 和填 0 都是 51.0pt；改用视图上的 `.lineSpacing(4)` 才是 59.0pt。
+    /// 所以富文本和纯文本一样走 `.lineSpacing`（见 richTextContent），
+    /// 别在这里改段落样式：既没用，还会把源文档的段落样式弄脏。
+    static func resizedRichText(_ rich: NSAttributedString) -> NSAttributedString {
+        let mutable = NSMutableAttributedString(attributedString: rich)
+        let full = NSRange(location: 0, length: mutable.length)
+        var missing: [NSRange] = []
+        mutable.enumerateAttribute(.font, in: full, options: []) { value, range, _ in
+            if let font = value as? NSFont {
+                mutable.addAttribute(.font,
+                                     value: NSFontManager.shared.convert(font, toSize: bodyFontSize),
+                                     range: range)
+            } else {
+                missing.append(range)   // 没带字体的段落：补一个系统正文字体
+            }
+        }
+        for range in missing {
+            mutable.addAttribute(.font, value: NSFont.systemFont(ofSize: bodyFontSize), range: range)
+        }
+        return mutable
+    }
+
     private var plainTextContent: some View {
         let capped = Self.cappedPreviewText(item.text)
+        // 有译文就显示译文，否则原文。正文尺寸/截断提示都沿用原来那套。
+        let body = translatedText ?? capped.body
+        // 对照模式：只有勾了「保留原文」**且**手上真有逐句数据时才走双行排版。
+        // 缺一半（刚勾上还没重译）就老老实实显示整段译文，不留一个空的对照框。
+        let pairs = shownPairs
         return VStack(alignment: .leading, spacing: 6) {
             // 提示放最前面：正文有 200 行高，写在末尾等于让人滚到底才看见
             if let note = capped.note {
@@ -194,16 +251,86 @@ struct PreviewCard: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
 
-            // 文本预览开选择：用户经常需要在预览里挑一段再复制
-            Text(capped.body)
-                .font(.system(size: 12))
-                .textSelection(.enabled)
-                // fixedSize 让文本按内容撑高（不然会被 ScrollView 的提案压扁），
-                // 也正因如此，内容长度必须在上游截断，否则就是整篇一次排版。
-                .fixedSize(horizontal: false, vertical: true)
-                .frame(maxWidth: .infinity, alignment: .leading)
+            // 标注当前是译文/对照：不标的话用户分不清"翻失败了没变"和"这就是译文"
+            if translatedText != nil {
+                HStack(spacing: 4) {
+                    Image(systemName: "character.bubble").font(.system(size: 9))
+                    Text(pairs == nil ? "译文 · \(translateTarget.title)"
+                                      : "对照 · 原文 + \(translateTarget.title)")
+                        .font(.system(size: 10, weight: .medium))
+                }
+                .foregroundStyle(.secondary)
+            }
+
+            if let pairs {
+                bilingualBody(pairs)
+            } else {
+                // 文本预览开选择：用户经常需要在预览里挑一段再复制
+                Text(body)
+                    .font(.system(size: Self.bodyFontSize))
+                    .lineSpacing(Self.bodyLineSpacing)
+                    .textSelection(.enabled)
+                    // fixedSize 让文本按内容撑高（不然会被 ScrollView 的提案压扁），
+                    // 也正因如此，内容长度必须在上游截断，否则就是整篇一次排版。
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
         }
     }
+
+    /// 当前真正在渲染的逐句对照数据（nil = 没走对照排版）。
+    /// 视图和「复制」共用这一个判据：两处各写一份条件，早晚会出现
+    /// "屏幕上是双语的、复制出来只有译文"这种错位。
+    private var shownPairs: [BilingualPair]? {
+        (translatedText != nil && keepOriginal) ? translatedPairs : nil
+    }
+
+    /// 「复制」到底复制什么，写在 help 里（按钮文案固定叫「复制」，不随状态变）
+    private var copyHelp: String {
+        if shownPairs != nil { return "复制屏幕上看到的全部内容（原文 + 译文）" }
+        if translatedText != nil { return "复制译文" }
+        return "复制这条记录"
+    }
+
+    /// 逐句对照：一句原文（弱化成次要色）在上，紧跟它自己的译文（正文色）在下。
+    ///
+    /// 用 `pair.id`（行号）当 ForEach 的 id：空行和重复行都会撞原文，撞了会画错或直接崩。
+    /// 行距沿用一个常量，但句与句之间再留 9pt —— 只有 4pt 的话，上下两行的间距
+    /// 和句内行距一样，"哪句是新的"就看不出来了。
+    private func bilingualBody(_ pairs: [BilingualPair]) -> some View {
+        VStack(alignment: .leading, spacing: 9) {
+            ForEach(pairs) { pair in
+                VStack(alignment: .leading, spacing: 1) {
+                    if !pair.original.isEmpty {
+                        Text(pair.original)
+                            .font(.system(size: Self.bodyFontSize))
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    if let translation = pair.translation, !translation.isEmpty {
+                        Text(translation)
+                            .font(.system(size: Self.bodyFontSize))
+                            .textSelection(.enabled)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }
+            }
+        }
+        .lineSpacing(Self.bodyLineSpacing)
+    }
+
+    /// 预览正文的字号（用户 2026-11-11 定：12 → 13 → 14，纯文本 / 译文 / 富文本 / 链接地址统一）
+    static let bodyFontSize: CGFloat = 14
+
+    /// 预览正文额外加的行距（px）。
+    ///
+    /// 14pt 系统字体自带的单倍行高约 17pt，长段落读起来挤成一坨（用户要求"行高加大一点"）。
+    /// 4pt 后行距约 21pt，是"看着舒展但没散架"的量；纯文本 / 译文 / 富文本 / 链接地址
+    /// 必须用同一个值，否则切换"原文 ↔ 译文"或换条目时行距会跳一下。
+    static let bodyLineSpacing: CGFloat = 4
 
     // ── 长文本保护 ───────────────────────────────────────────
 
@@ -255,7 +382,8 @@ struct PreviewCard: View {
                     .foregroundStyle(Color(nsColor: .systemBlue))
                 }
                 Text(item.text)
-                    .font(.system(size: 12, design: .monospaced))
+                    .font(.system(size: Self.bodyFontSize, design: .monospaced))
+                    .lineSpacing(Self.bodyLineSpacing)
                     .textSelection(.enabled)
                     .fixedSize(horizontal: false, vertical: true)
                 Button {
@@ -328,16 +456,49 @@ struct PreviewCard: View {
             Button("粘贴") { model.pasteSelected() }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.small)
-            Button("复制") { model.copySelectedToList() }
-                .controlSize(.small)
+            // 一律叫「复制」：按钮文案跟着状态改，用户反而要猜"这一下复制的是什么"。
+            // 复制的语义固定成**屏幕上看到的那份内容**：
+            //   · 看过翻译了 → 对照模式复制"原文 + 译文"，整段模式复制译文；
+            //   · 没翻译 → 复制这条记录本身。
+            // 具体复制什么写进 help，不靠按钮文案去区分。
+            Button("复制") {
+                if let pairs = shownPairs {
+                    // 对照模式：原文 + 译文都带上（用户明确要求"复制所有的文本内容"）
+                    copy(TranslateTarget.joinedBilingual(pairs))
+                } else if let translated = translatedText {
+                    copy(translated)
+                } else {
+                    model.copySelectedToList()
+                }
+            }
+            .controlSize(.small)
+            .help(copyHelp)
             Button(item.pinned ? "取消置顶" : "置顶") { model.togglePinSelected() }
                 .controlSize(.small)
+            // 翻译只对纯文本条目出现：图片/文件/颜色没有可翻的句子，
+            // 留个翻不动的按钮比没有更糟。macOS 14 没有 Translation 框架，同样不显示。
+            if item.kind == .text {
+                translateBar
+            }
             Spacer(minLength: 0)
-            Button("删除") { model.isPreviewing = false; model.deleteSelected() }
+            Button("删除") { model.closePreview(); model.deleteSelected() }
                 .controlSize(.small)
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
+    }
+
+    @ViewBuilder
+    private var translateBar: some View {
+        if #available(macOS 15.0, *) {
+            // 翻的是"预览里看到的这段"（已截断），不是全文：
+            // 显示与翻译必须同一份内容，否则译文比原文长一截，用户会以为串了。
+            TranslateBar(sourceText: Self.cappedPreviewText(item.text).body,
+                         translated: $translatedText,
+                         target: $translateTarget,
+                         keepOriginal: $keepOriginal,
+                         pairs: $translatedPairs)
+        }
     }
 
     // ── 小工具 ───────────────────────────────────────────────
